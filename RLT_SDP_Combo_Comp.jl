@@ -266,7 +266,38 @@ function solve_and_print(
     return m
 end
 
-export build_RLT_SDP_comp_model, solve_and_print, RelaxationModes
+# --------------------------------------------------------------
+# Solve wrapper (compatible with BigM-side batch code pattern)
+# Returns: (status, obj, x, v, X, V, W, time_sec)
+# --------------------------------------------------------------
+function solve_RLT_SDP_comp(
+    data::Dict{String,Any};
+    variant::String="RLT_S2U",
+    optimizer = MosekTools.Optimizer,
+    relaxation::Symbol = :RLT,
+)
+    m = build_RLT_SDP_comp_model(
+        data; variant=variant, optimizer=optimizer, relaxation=relaxation
+    )
+
+    t0 = time_ns()
+    optimize!(m)
+    t = round((time_ns() - t0) / 1e9; digits=4)
+
+    st = termination_status(m)
+    if st in (MOI.OPTIMAL, MOI.LOCALLY_SOLVED, MOI.ALMOST_OPTIMAL)
+        x = value.(m[:x])
+        v = value.(m[:v])
+        X = value.(m[:X])
+        V = value.(m[:V])
+        W = value.(m[:W])
+        return (st, objective_value(m), x, v, X, V, W, t)
+    else
+        return (st, nothing, nothing, nothing, nothing, nothing, nothing, t)
+    end
+end
+
+export build_RLT_SDP_comp_model, solve_RLT_SDP_comp, solve_and_print, RelaxationModes
 
 end # module
 

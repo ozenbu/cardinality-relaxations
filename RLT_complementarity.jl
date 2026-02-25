@@ -339,7 +339,7 @@ if isinteractive()
 
 
     #inst = alp_inst
-    inst = diff_inst
+    inst = alp_inst
 
     # =========================================================
     # Run all variants (loop)

@@ -425,5 +425,5 @@ if isinteractive()
     using .EUIUdiffinstance
 
     diff_inst = euiu_diff_instance()
-    RLTBigM.demo(diff_inst)
+    RLTBigM.demo(alp_inst)
 end
