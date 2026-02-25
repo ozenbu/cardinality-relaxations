@@ -382,3 +382,22 @@ function solve_RLT_SDP(
 end
 
 end # module
+
+
+
+include("instances/alper_stqp_instance.jl")
+include("instances/prettyprint.jl")
+
+using .RLT_SDP_Combo
+using .AlperStqpInstances
+using .PrettyPrint
+
+inst = alper_stqp_rho3_instance()
+
+print_instance(inst; show_mats=true, digits=4)
+
+st, obj, x, u, X, R, U, t = RLT_SDP_Combo.solve_RLT_SDP(
+    inst; variant="IU", relaxation=:RLT_full_SDP
+)
+
+print_solution(st, obj, x, u, X, R, U, t; digits=6, show_mats=true)

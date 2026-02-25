@@ -89,13 +89,12 @@ function build_blockSDP_closest_model(
     add_relaxation_blocks!(m, relaxation_variant, x, u, X, R, U, params)
     
     """
-    # 2) directly adding as a constraint
     @variable(m, Y[1:n+1,1:n+1], Symmetric)
     @constraint(m, Y .== [1.0  u'
                           u    U] )
     @constraint(m, Y in PSDCone())
-    
-    """               
+    """     
+              
     @constraint(m, [1.0  u'
                     u    U] in PSDCone())
     

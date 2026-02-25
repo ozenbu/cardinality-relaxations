@@ -357,7 +357,7 @@ function plot_instance(df::DataFrame, inst_id::Int; outdir::AbstractString = "pl
         linestyle = :solid,
         label     = "EU gap",
         size      = (1200, 600),
-        margin    = 15mm,
+        margin    = 20mm,
         color     = :olivedrab,
     )
 
@@ -411,7 +411,7 @@ if isinteractive()
     using .PlotGradualSDP
     using MosekTools
     using Gurobi
-
+    
     
     # 2) Run all relaxations on all instances
     batch = RLT_SDP_Batch.run_batch(
@@ -430,3 +430,6 @@ if isinteractive()
     # 3) Plot all instances (gap vs mode, time on right axis)
     PlotGradualSDP.plot_all_instances("gradual_sdp_results.csv"; outdir = "plots")
 end 
+
+
+

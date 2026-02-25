@@ -1187,6 +1187,123 @@ function random_orthogonal(rng::AbstractRNG, n::Int)
 end
 
 """
+Build one quadratic inequality
+
+    g(x) = 0.5 x'Q x + q'x + r <= 0
+
+from a *given* vertex set:
+
+- Anchor x̄ and all `feas_verts` are strictly feasible: g(x) <= -eps_feas
+- `v_cut` is strictly cut: g(v_cut) >= eps_cut
+
+Eigenpattern is controlled by (want_convex, num_neg):
+
+- want_convex = true  => all lambda_i >= 0, num_neg must be 0
+- want_convex = false => choose num_neg indices with lambda_i <= -eig_eps,
+                         others lambda_j >= 0
+
+All constraints are linear in (lambda, q, r), so this is an LP.
+"""
+function build_QI_from_vertex_set(
+    rng::AbstractRNG,
+    xbar::AbstractVector,
+    feas_verts::Vector{Vector{Float64}},
+    v_cut::Vector{Float64};
+    want_convex::Bool,
+    num_neg::Int,
+    eps_feas::Real = 0.5,
+    eps_cut::Real  = 0.5,
+    eig_eps::Real  = 0.1,
+    coef_bound::Real = 5.0,
+    optimizer = MosekTools.Optimizer,
+)
+    n = length(xbar)
+    @assert length(v_cut) == n "v_cut must have length n"
+    for v in feas_verts
+        @assert length(v) == n "All feasible vertices must have length n"
+    end
+
+    @assert 0 ≤ num_neg ≤ n "build_QI_from_vertex_set: num_neg must be between 0 and n."
+    if want_convex
+        @assert num_neg == 0 "In convex mode, num_neg must be 0 for QI."
+    end
+
+    # Random orthogonal basis
+    Qmat = random_orthogonal(rng, n)
+
+    model = Model(optimizer)
+    @variable(model, lambda[1:n])
+    @variable(model, q[1:n])
+    @variable(model, r)
+
+    # Eigenvalue pattern
+    if want_convex
+        @constraint(model, lambda .>= 0.0)
+    else
+        neg_idx = num_neg == 0 ? Int[] : randperm(rng, n)[1:num_neg]
+        pos_idx = setdiff(1:n, neg_idx)
+        for i in neg_idx
+            @constraint(model, lambda[i] <= -eig_eps)
+        end
+        for j in pos_idx
+            @constraint(model, lambda[j] >= 0.0)
+        end
+    end
+
+    # Coefficient bounds
+    for i in 1:n
+        @constraint(model, -coef_bound <= lambda[i] <= coef_bound)
+        @constraint(model, -coef_bound <= q[i]      <= coef_bound)
+    end
+    @constraint(model, -coef_bound <= r <= coef_bound)
+
+    # Helper: add g(x) (<= or >= rhs)
+    function add_qi_constraint!(x::AbstractVector, sense::Symbol, rhs::Real)
+        @assert length(x) == n
+        y = Qmat' * x
+        if sense === :le
+            @constraint(
+                model,
+                sum(0.5 * (y[i]^2) * lambda[i] for i in 1:n) +
+                sum(x[j] * q[j] for j in 1:n) + r <= rhs
+            )
+        elseif sense === :ge
+            @constraint(
+                model,
+                sum(0.5 * (y[i]^2) * lambda[i] for i in 1:n) +
+                sum(x[j] * q[j] for j in 1:n) + r >= rhs
+            )
+        else
+            error("Unsupported sense $sense in add_qi_constraint! (expected :le or :ge)")
+        end
+    end
+
+    # Anchor + feasible vertices: strictly feasible
+    add_qi_constraint!(xbar, :le, -eps_feas)
+    for v in feas_verts
+        add_qi_constraint!(v, :le, -eps_feas)
+    end
+
+    # Cut vertex: strictly infeasible
+    add_qi_constraint!(v_cut, :ge, eps_cut)
+
+    @objective(model, Min, 0.0)
+    optimize!(model)
+    status = termination_status(model)
+    @assert status == MOI.OPTIMAL "build_QI_from_vertex_set: LP not solved to OPTIMAL, status = $status"
+
+    λ_opt = value.(lambda)
+    q_opt = value.(q)
+    r_opt = value(r)
+
+    # Build Q = Qmat * Diag(λ) * Qmat'
+    Q = Qmat * Diagonal(λ_opt) * Qmat'
+    Q = 0.5 * (Q + Q')  # symmetrize
+
+    return Q, Vector{Float64}(q_opt), Float64(r_opt)
+end
+
+"""
 Collect k distinct vertices of {x : A x <= b, H x = h} via repeated LP solves.
 Anchor xbar is excluded from the vertex set (we keep it separate).
 
@@ -2725,3 +2842,117 @@ println("Instance IDs:")
 for d in insts
     println("  ", d["id"])
 end
+
+
+"""
+Bomze et al. sparse StQP instance for ρ = 3 (final-version tag "fv").
+
+Region:
+    x ≥ 0,  eᵀx = 1,  ‖x‖₀ ≤ 3
+
+Objective:
+    min  xᵀ Q x   (implemented as 0.5 xᵀ Q0 x with Q0 = 2Q)
+
+No extra linear or quadratic constraints are added; this is a pure StQP
+over the simplex, convex in x (Q0 is positive definite), but will be
+used with a cardinality constraint ρ = 3.
+"""
+function bomze_stqp_rho3_instance(; bigM_scale::Real = 1.0)
+    n   = 6
+    rho = 3
+
+    # Q taken from Alper's slide (Bomze et al. example)
+    Q = [
+        2.6947  -0.2028  -1.1144  -2.4230  -2.1633   0.7710
+       -0.2028   5.1998   0.5005  -2.0941   0.7828  -3.3611
+       -1.1144   0.5005   5.2918   1.4119  -1.1526  -1.9723
+       -2.4230  -2.0941   1.4119   4.1140  -0.2025   0.3132
+       -2.1633   0.7828  -1.1526  -0.2025   7.6645  -0.0170
+        0.7710  -3.3611  -1.9723   0.3132  -0.0170   3.3040
+    ]
+
+    # Our convention is obj = 0.5 x'Q0 x + q0'x, so choose Q0 = 2Q, q0 = 0
+    Q0 = 2.0 .* Q
+    q0 = zeros(Float64, n)
+
+    # Base region: simplex  x ≥ 0, eᵀx = 1
+    A, b, H, h = UserInstanceGen.build_simplex_bounds(n)
+
+    # Anchor point: barycenter of the simplex
+    xbar = fill(1.0 / n, n)
+
+    # Bounds on simplex: each coordinate in [0,1]
+    ell = zeros(Float64, n)
+    u   = ones(Float64, n)
+    UserInstanceGen.clean_bounds!(ell, u; digits = 4)
+
+    # Big-M from bounds
+    M_common, M_minus, M_plus = UserInstanceGen.bigM_from_bounds(ell, u; scale = bigM_scale)
+
+    # Pack into Dict consistent with generate_instance output
+    inst = Dict{String,Any}()
+
+    inst["n"]   = n
+    inst["rho"] = rho
+
+    inst["Q0"] = Q0
+    inst["q0"] = q0
+
+    # No quadratic (in)equality constraints
+    inst["Qi"] = nothing
+    inst["qi"] = nothing
+    inst["ri"] = nothing
+
+    inst["Pi"] = nothing
+    inst["pi"] = nothing
+    inst["si"] = nothing
+
+    # Linear constraints of the simplex
+    inst["A"] = A
+    inst["b"] = b
+    inst["H"] = H
+    inst["h"] = h
+
+    inst["ell"]     = ell
+    inst["u"]       = u
+    inst["M"]       = M_common
+    inst["M_minus"] = M_minus
+    inst["M_plus"]  = M_plus
+
+    inst["xbar"] = xbar
+
+    inst["base_type"] = "simplex"
+    inst["want_convex"] = true
+
+    # Eigenvalue pattern: Q0 is PSD, no QI
+    inst["neg_eig_counts_input"] = [0]
+    inst["neg_eig_counts_used"]  = [0]
+
+    # Seed is arbitrary for this deterministic instance
+    inst["seed"] = 0
+
+    # Meta tags
+    inst["base_tag"]  = "S"
+    inst["convexity"] = "CVX"
+
+    inst["n_LI"] = 0
+    inst["n_LE"] = 0
+    inst["n_QI"] = 0
+    inst["n_QE"] = 0
+    inst["bigM_scale"] = bigM_scale
+
+    # Final ID with "fv" tag (final version)
+    inst["id"] = "n6_rho3_S_StQP_rho3_CVX_fv"
+
+    return inst
+end
+
+# Read instances.json
+instances_all = InstanceGen.load_instances_json("instances.json")
+
+# Add instance
+push!(instances_all, bomze_stqp_rho3_instance())
+
+# Resave
+InstanceGen.save_instances_json("instances.json", instances_all)
+println("Total number of instances:", length(instances_all))
