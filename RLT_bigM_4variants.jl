@@ -203,13 +203,15 @@ end
 function build_and_solve(data; variant::String="EXACT",
                          build_only::Bool=false,
                          optimizer=Gurobi.Optimizer,
-                         verbose=false)
+                         verbose::Bool=false,
+                         dump_files::Bool=false)
     params = prepare_instance(data)
     @unpack n, ρ, Q0, q0, Qi, qi, ri, Pi, pi, si,
             A, b, ℓ, H, h, η, Mminus, Mplus, e = params
 
     m = Model(optimizer)
-    set_silent(m); verbose && set_optimizer_attribute(m,"OutputFlag",1)
+    set_silent(m)
+    verbose && set_optimizer_attribute(m, "OutputFlag", 1)
 
     set_name(m, "SQCQP_RLT_or_EXACT")
 
@@ -221,7 +223,7 @@ function build_and_solve(data; variant::String="EXACT",
         # Objective: 0.5 x' Q0 x + q0' x
         @objective(m, Min, 0.5 * x' * Q0 * x + q0' * x)
 
-        # (allow nonconvex quadratic)
+        # Allow nonconvex quadratic
         set_optimizer_attribute(m, "NonConvex", 2)
 
         # Original constraints
@@ -235,12 +237,12 @@ function build_and_solve(data; variant::String="EXACT",
         # Cardinality: sum u ≤ ρ
         @constraint(m, sum(u) <= ρ)
 
-        # Quadratic inequality rows:  0.5 x' Qi x + qi' x + ri ≤ 0
+        # Quadratic inequality rows
         for (Qmat, qvec, rterm) in zip(Qi, qi, ri)
             @constraint(m, 0.5 * x' * Qmat * x + qvec' * x + rterm <= 0)
         end
 
-        # Quadratic equality rows:  0.5 x' Pj x + pj' x + sj = 0
+        # Quadratic equality rows
         for (Pmat, pvec, sterm) in zip(Pi, pi, si)
             @constraint(m, 0.5 * x' * Pmat * x + pvec' * x + sterm == 0)
         end
@@ -302,40 +304,44 @@ function build_and_solve(data; variant::String="EXACT",
         term = termination_status(m)
 
         if term == MOI.OPTIMAL
-            #  dump primal to txt: x, u, X, R, U 
-            begin
-                ts = Dates.format(Dates.now(), "yyyymmdd_HHMMSS")
-                fname = "primal_sol_$(variant)_$(ts).txt"
-                open(fname, "w") do io
-                    println(io, "# variant=", variant,
-                                "  status=OPTIMAL  obj=", objective_value(m))
-                    println(io, "x = ", value.(x))
-                    println(io, "u = ", value.(u))
-                    print(io,   "X = "); show(io, "text/plain", value.(X)); println(io)
-                    print(io,   "R = "); show(io, "text/plain", value.(R)); println(io)
-                    print(io,   "U = "); show(io, "text/plain", value.(U)); println(io)
+            if dump_files
+                # Dump primal solution
+                begin
+                    ts = Dates.format(Dates.now(), "yyyymmdd_HHMMSS")
+                    fname = "primal_sol_$(variant)_$(ts).txt"
+                    open(fname, "w") do io
+                        println(io, "# variant=", variant,
+                                    "  status=OPTIMAL  obj=", objective_value(m))
+                        println(io, "x = ", value.(x))
+                        println(io, "u = ", value.(u))
+                        print(io,   "X = "); show(io, "text/plain", value.(X)); println(io)
+                        print(io,   "R = "); show(io, "text/plain", value.(R)); println(io)
+                        print(io,   "U = "); show(io, "text/plain", value.(U)); println(io)
+                    end
+                    println("saved primal solution to $fname")
                 end
-                println("saved primal solution to $fname")
-            end
-            # dump dual to txt
-            if JuMP.has_duals(m)
-                ts    = Dates.format(Dates.now(), "yyyymmdd_HHMMSS")
-                fname = "primal_duals_$(variant)_$(ts).txt"
-                open(fname, "w") do io
-                    @printf(io, "# variant=%s  status=%s  obj=%.12g\n\n",
-                            variant, string(term), objective_value(m))
-                    for con in JuMP.all_constraints(m;
-                            include_variable_in_set_constraints=true)
-                        try
-                            d = dual(con)
-                            println(io, string(con), " = ", @sprintf("%.9g", d))
-                        catch
-                            # dual raporlanmayan kısıt/solver olursa atla
+
+                # Dump dual multipliers (if available)
+                if JuMP.has_duals(m)
+                    ts    = Dates.format(Dates.now(), "yyyymmdd_HHMMSS")
+                    fname = "primal_duals_$(variant)_$(ts).txt"
+                    open(fname, "w") do io
+                        @printf(io, "# variant=%s  status=%s  obj=%.12g\n\n",
+                                variant, string(term), objective_value(m))
+                        for con in JuMP.all_constraints(m;
+                                include_variable_in_set_constraints=true)
+                            try
+                                d = dual(con)
+                                println(io, string(con), " = ", @sprintf("%.9g", d))
+                            catch
+                                # Skip constraints without duals
+                            end
                         end
                     end
+                    println("saved primal-side dual multipliers to $fname")
                 end
-                println("saved primal-side dual multipliers to $fname")
             end
+
             return (:OPTIMAL, objective_value(m),
                     value.(x), value.(u), value.(X), value.(R), value.(U))
 
@@ -348,8 +354,38 @@ function build_and_solve(data; variant::String="EXACT",
         else
             return (:OTHER, term, nothing, nothing, nothing, nothing, nothing)
         end
-
     end
+end
+
+# ---------- pretty wrapper ----------
+function solve_and_print(data;
+    variant::String="IU",
+    relaxation = :RLT,
+    optimizer = Gurobi.Optimizer,
+    verbose::Bool=false,
+    pp_kwargs...
+)
+    if !isdefined(Main, :PrettyPrint)
+        error("PrettyPrint is not loaded. Please `include(\".../PrettyPrint.jl\")` before calling solve_and_print.")
+    end
+
+    m = build_and_solve(data;
+        variant=variant,
+        build_only=true,
+        optimizer=optimizer,
+        verbose=verbose,
+        dump_files=false
+    )
+    optimize!(m)
+
+    Main.PrettyPrint.print_model_solution(
+        m;
+        variant=variant,
+        relaxation=relaxation,
+        pp_kwargs...
+    )
+
+    return m
 end
 
 # ---------- inspect ----------
@@ -365,259 +401,29 @@ function inspect_model(data, variant::String; optimizer=Gurobi.Optimizer)
 end
 
 # ---------- demo ----------
-function demo()
-    data1 = Dict(
-        "n"  => 4,
-        "rho"=> 3.0,
-        "Q0" => zeros(4,4),
-        "q0" => [-1.0, 0.0, 0.0, 0.0],
-        "Qi" => nothing, "qi"=>nothing, "ri"=>nothing,
-        "Pi" => nothing, "pi"=>nothing, "si"=>nothing,
-        "A"  => nothing, "b"=>nothing,
-        "H"  => nothing, "h"=>nothing,
-        "M"  => I(4)
-    )
-
-    n   = 4
-    ρ   = 3.0
-    ℓb  = [-1.0, -0.5, -2.0, -0.3]   # lower bounds
-    ū   = [ 1.0,  0.8,  0.7,  2.5]   # upper bounds
-    Mvec = max.(abs.(ℓb), abs.(ū))   # Big-M not tighter than box
-    Mmat = Diagonal(Mvec)
-
-    A = [I(n); -I(n)]
-    b = vcat(ū, -ℓb)
-    H = nothing
-    h = nothing
-    
-    data3 = Dict(
-        "n"  => n,
-        "rho"=> ρ,
-        "Q0" => zeros(n,n),
-        "q0" => [-29.0, 43.0, -30.0, 70.0],
-        "Qi" => nothing, "qi"=>nothing, "ri"=>nothing,
-        "Pi" => nothing, "pi"=>nothing, "si"=>nothing,
-        "A"  => A, "b"=> b,
-        "H"  => H, "h"=> h,
-        "M"  => Mmat
-    )
-
-    H = [ 1.0  -2.0   0.0   0.0;
-          0.0   0.0   1.0   1.0 ]
-    h = [0.0, 0.0]
-
-    dataA = Dict(
-        "n"  => n, "rho"=> ρ,
-        "Q0" => zeros(n,n),
-        "q0" => [-29.0, 43.0, -30.0, 70.0],
-        "Qi" => nothing, "qi"=>nothing, "ri"=>nothing,
-        "Pi" => nothing, "pi"=>nothing, "si"=>nothing,
-        "A"  => A, "b"=>b,
-        "H"  => H, "h"=>h,
-        "M"  => Mmat
-    )
-
-    Q1 = diagm(0 => [2.0, 2.0, 0.0, 0.0])     # 0.5*Q1 gives x1^2 + x2^2
-    q1 = [-0.6, 0.4, 0.0, 0.0]
-    r1 = -0.87
-
-    dataB = Dict(
-        "n"  => n, "rho"=> ρ,
-        "Q0" => zeros(n,n),
-        "q0" => [-12.0, 8.0, 5.0, -3.0],
-        "Qi" => (Q1,), "qi" => (q1,), "ri" => (r1,),
-        "Pi" => nothing, "pi"=>nothing, "si"=>nothing,
-        "A"  => A, "b"=>b,
-        "H"  => nothing, "h"=>nothing,
-        "M"  => Mmat
-    )
-
-    P1 = diagm(0 => [0.0, 0.0, 2.0, 2.0])   # 0.5*P1 gives x3^2 + x4^2
-    p1 = zeros(n)
-    s1 = -2.25
-
-    dataC = Dict(
-        "n"  => n, "rho"=> ρ,
-        "Q0" => zeros(n,n),
-        "q0" => [5.0, -4.0, 1.0, 2.0],
-        "Qi" => nothing, "qi"=>nothing, "ri"=>nothing,
-        "Pi" => (P1,), "pi" => (p1,), "si" => (s1,),
-        "A"  => A, "b"=>b,
-        "H"  => [1.0 -2.0 0.0 0.0], "h" => [0.0],
-        "M"  => Mmat
-    )
-
-    # Inequality 1: (x1 - x2)^2 ≤ 0.5
-    Q2 = zeros(n,n);  Q2[1,1]=2.0; Q2[2,2]=2.0; Q2[1,2]=-2.0; Q2[2,1]=-2.0
-    q2 = zeros(n)
-    r2 = -0.5
-
-    # Inequality 2: reuse the ball from dataB
-    Q3 = Q1;  q3 = q1;  r3 = r1
-
-    # Equality: reuse the circle from dataC
-    P2 = P1;  p2 = p1;  s2 = s1
-
-    H2 = [ 1.0  -1.0   0.0   0.0 ]
-    h2 = [ 0.0 ]
-
-    dataD = Dict(
-        "n"  => n, "rho"=> ρ,
-        "Q0" => zeros(n,n),
-        "q0" => [-29.0, 43.0, -30.0, 70.0],
-        "Qi" => (Q2, Q3), "qi" => (q2, q3), "ri" => (r2, r3),
-        "Pi" => (P2,),    "pi" => (p2,),    "si" => (s2,),
-        "A"  => A, "b"=>b,
-        "H"  => H2, "h"=>h2,
-        "M"  => Mmat
-    )
-
-    # small rational example
-    Q0 = [
-        3//10000    127//1250   79//2500    867//10000;
-        127//1250   1//500      1001//10000 1059//10000;
-        79//2500    1001//10000 -1//2000    -703//10000;
-        867//10000  1059//10000 -703//10000 -1063//10000
-    ]
-    Q0d = Q0*20000
-
-    q0 = [-1973//10000, -2535//10000, -1967//10000, -973//10000]
-    q0d = q0*20000
-
-    A2 = [ 1.0  0.0  0.0  0.0
-           0.0  1.0  0.0  0.0
-           0.0  0.0  1.0  0.0
-           0.0  0.0  0.0  1.0
-          -1.0  0.0  0.0  0.0
-           0.0 -1.0  0.0  0.0
-           0.0  0.0 -1.0  0.0
-           0.0  0.0  0.0 -1.0 ]
-
-    b2 = [1.0, 1.0, 1.0, 1.0,   1.0, 1.0, 1.0, 1.0]
-
-    data_test4 = Dict(
-        "n"  => 4,
-        "rho"=> 3.0,
-        "Q0" => Q0d,
-        "q0" => q0d,
-        "Qi" => nothing, "qi" => nothing, "ri" => nothing,
-        "Pi" => nothing, "pi" => nothing, "si" => nothing,
-        "A"  => A2, "b"  => b2,
-        "H"  => nothing, "h"  => nothing,
-        "M"  => I(4)
-    )
-
-    function bomze_stqp_rho3_instance(; bigM_scale::Real = 1.0)
-        n   = 6
-        rho = 3
-
-        # Q taken from Alper's slide (Bomze et al. example)
-        Q = [
-            2.6947  -0.2028  -1.1144  -2.4230  -2.1633   0.7710
-        -0.2028   5.1998   0.5005  -2.0941   0.7828  -3.3611
-        -1.1144   0.5005   5.2918   1.4119  -1.1526  -1.9723
-        -2.4230  -2.0941   1.4119   4.1140  -0.2025   0.3132
-        -2.1633   0.7828  -1.1526  -0.2025   7.6645  -0.0170
-            0.7710  -3.3611  -1.9723   0.3132  -0.0170   3.3040
-        ]
-
-        # Our convention is obj = 0.5 x'Q0 x + q0'x, so choose Q0 = 2Q, q0 = 0
-        Q0 = 2.0 .* Q
-        q0 = zeros(Float64, n)
-
-        # ----------------------------------------------------------
-        # Base region: simplex  { x ∈ R^n : x ≥ 0, eᵀx = 1 }.
-        # Encode x ≥ 0 as -I x ≤ 0
-        # ----------------------------------------------------------
-        A = -Matrix{Float64}(I, n, n)
-        b = zeros(Float64, n)
-        H = ones(Float64, 1, n)
-        h = [1.0]
-
-        # Bounds on simplex: each coordinate in [0,1]
-        Mminus = zeros(n)
-        Mplus  = ones(n)
-
-        # Pack into Dict consistent with generate_instance output
-        inst = Dict{String,Any}()
-
-        inst["n"]   = n
-        inst["rho"] = rho
-
-        inst["Q0"] = Q0
-        inst["q0"] = q0
-
-        # No quadratic (in)equality constraints
-        inst["Qi"] = nothing
-        inst["qi"] = nothing
-        inst["ri"] = nothing
-
-        inst["Pi"] = nothing
-        inst["pi"] = nothing
-        inst["si"] = nothing
-
-        # Linear constraints of the simplex
-        inst["A"] = A
-        inst["b"] = b
-        inst["H"] = H
-        inst["h"] = h
-
-        inst["Mminus"] = Mminus
-        inst["Mplus"]  = Mplus
-
-        inst["base_type"] = "simplex"
-        inst["want_convex"] = true
-
-        # Eigenvalue pattern: Q0 is PSD, no QI
-        inst["neg_eig_counts_input"] = [0]
-        inst["neg_eig_counts_used"]  = [0]
-
-        # Seed is arbitrary for this deterministic instance
-        inst["seed"] = 0
-
-        # Meta tags
-        inst["base_tag"]  = "S"
-        inst["convexity"] = "CVX"
-
-        inst["n_LI"] = 0
-        inst["n_LE"] = 0
-        inst["n_QI"] = 0
-        inst["n_QE"] = 0
-        inst["bigM_scale"] = bigM_scale
-
-        # Final ID with "fv" tag (final version)
-        inst["id"] = "n6_rho3_S_StQP_rho3_CVX_fv"
-
-        return inst
-    end
-
-    a_data = bomze_stqp_rho3_instance(; bigM_scale = 1.0)
-
-
-
-    for var in ("EXACT","E","EU","I","IU")
-        res = build_and_solve(a_data; variant=var)
-        println("variant=$var → ", res[1], "  obj=", res[2])
-        if res[1] == :OPTIMAL
-            if var == "EXACT"
-                _, _, x, u = res
-                println("x=", x, "  u=", u)
-            else
-                _, _, x, u, X, R, U = res
-                println("x=", x, "  u=", u)
-                println("X ="); show(stdout, "text/plain", X); println("\n")
-                println("R ="); show(stdout, "text/plain", R); println("\n")
-                println("U ="); show(stdout, "text/plain", U); println("\n")
-            end
-        end
+function demo(instance_data)
+    for var in ("EXACT", "E", "EU", "I", "IU")
+        rel = (var == "EXACT") ? "EXACT" : :RLT
+        solve_and_print(instance_data; variant=var, relaxation=rel, show_mats=true)
     end
 end
 
 end # module RLTBigM
 
-
 if isinteractive()
     using .RLTBigM
-    RLTBigM.demo()
-end
+    include("instances/alper_stqp_instance.jl")
+    include("instances/prettyprint.jl")
 
+    using .AlperStqpInstances
+    using .PrettyPrint
+
+    alp_inst = alper_stqp_rho3_instance()
+
+    include("instances/diff_RLTEU_RLTIU_bigM_instance.jl")
+
+    using .EUIUdiffinstance
+
+    diff_inst = euiu_diff_instance()
+    RLTBigM.demo(diff_inst)
+end

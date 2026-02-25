@@ -2,52 +2,36 @@ module PrettyPrint
 
 using Printf
 using LinearAlgebra
+using JuMP
+using MathOptInterface
+const MOI = MathOptInterface
 
-export print_instance, print_solution, print_vec, print_mat
+export print_vec, print_mat, print_model_solution
 
 # ----------------------------
-# Helpers
+# Small helpers
 # ----------------------------
-# Makes tiny numbers (|v| < tol) 0.0.
 _clean(v::Real; tol::Real=1e-9) = (isfinite(v) && abs(v) < tol) ? 0.0 : Float64(v)
 
-function _fmt(v::Real; digits::Int=6, tol::Real=1e-9, width::Int=12)
-    @sprintf("%*.*f", width, digits, _clean(v; tol=tol))
-end
-
-# ----------------------------
-# Pretty vector / matrix
-# ----------------------------
-function print_vec(name::AbstractString, v::AbstractVector;
-                   digits::Int=6, tol::Real=1e-9, per_line::Bool=true)
+function print_vec(name::AbstractString, v::AbstractVector; digits::Int=6, tol::Real=1e-9)
     println("\n", name, " =")
-    if per_line
-        for i in eachindex(v)
-            @printf("  %s[%d] = %.*f\n", name, i, digits, _clean(v[i]; tol=tol))
-        end
-    else
-        print("  [")
-        for i in eachindex(v)
-            s = @sprintf("%.*f", digits, _clean(v[i]; tol=tol))
-            print(i == firstindex(v) ? s : ", " * s)
-        end
-        println("]")
+    for i in eachindex(v)
+        @printf("  %s[%d] = %.*f\n", name, i, digits, _clean(v[i]; tol=tol))
     end
     return nothing
 end
 
 function print_mat(name::AbstractString, M::AbstractMatrix;
                    digits::Int=6, tol::Real=1e-9,
-                   max_rows::Int=12, max_cols::Int=12, width::Int=12)
+                   max_rows::Int=20, max_cols::Int=20, width::Int=12)
     println("\n", name, " =")
     m, n = size(M)
-
     r_show = min(m, max_rows)
     c_show = min(n, max_cols)
 
     for i in 1:r_show
         for j in 1:c_show
-            print(_fmt(M[i,j]; digits=digits, tol=tol, width=width))
+            @printf("%*.*f", width, digits, _clean(M[i,j]; tol=tol))
         end
         if c_show < n
             print("  ...")
@@ -60,88 +44,105 @@ function print_mat(name::AbstractString, M::AbstractMatrix;
     return nothing
 end
 
-# ----------------------------
-# Instance printer
-# ----------------------------
-function print_instance(inst::Dict{String,Any};
-                        show_mats::Bool=true, digits::Int=4, tol::Real=1e-12)
-
-    id        = get(inst, "id", "unknown")
-    n         = get(inst, "n", missing)
-    rho       = get(inst, "rho", missing)
-    base_type = get(inst, "base_type", "unknown")
-    convexity = get(inst, "convexity", "unknown")
-    want_cvx  = get(inst, "want_convex", missing)
-    bigM      = get(inst, "bigM_scale", missing)
-
-    println("\n================= INSTANCE =================")
-    println("id         = ", id)
-    println("n          = ", n)
-    println("rho        = ", rho)
-    println("base_type  = ", base_type)
-    println("convexity  = ", convexity)
-    println("want_convex= ", want_cvx)
-    println("bigM_scale = ", bigM)
-
-    Q0 = get(inst, "Q0", nothing)
-    q0 = get(inst, "q0", nothing)
-
-    if Q0 !== nothing
-        Q0sym = Symmetric(Q0)
-        evals = eigvals(Matrix(Q0sym))
-        println("Q0 eig min = ", minimum(evals))
-        println("Q0 eig max = ", maximum(evals))
+# Detect whether a variable container is binary/continuous
+function _var_kind(obj)
+    if obj isa JuMP.VariableRef
+        return JuMP.is_binary(obj) ? "binary" : (JuMP.is_integer(obj) ? "integer" : "continuous")
     end
-
-    if show_mats
-        if Q0 !== nothing; print_mat("Q0", Q0; digits=digits, tol=tol) end
-        if q0 !== nothing; print_vec("q0", q0; digits=digits, tol=tol, per_line=false) end
-
-        A = get(inst, "A", nothing)
-        b = get(inst, "b", nothing)
-        H = get(inst, "H", nothing)
-        h = get(inst, "h", nothing)
-        Mminus = get(inst, "Mminus", nothing)
-        Mplus  = get(inst, "Mplus", nothing)
-
-        if A !== nothing; print_mat("A", A; digits=digits, tol=tol) end
-        if b !== nothing; print_vec("b", b; digits=digits, tol=tol, per_line=false) end
-        if H !== nothing; print_mat("H", H; digits=digits, tol=tol) end
-        if h !== nothing; print_vec("h", h; digits=digits, tol=tol, per_line=false) end
-        if Mminus !== nothing; print_vec("Mminus", Mminus; digits=digits, tol=tol, per_line=false) end
-        if Mplus  !== nothing; print_vec("Mplus",  Mplus;  digits=digits, tol=tol, per_line=false) end
+    try
+        return _var_kind(first(obj))
+    catch
+        return "unknown"
     end
-
-    return nothing
 end
 
 # ----------------------------
-# Solution printer
+# Main: print directly from a JuMP model
 # ----------------------------
-function print_solution(st, obj, x, u, X, R, U, t;
-                        digits::Int=6, tol::Real=1e-9,
-                        show_mats::Bool=true, mat_digits::Int=6)
+function print_model_solution(model::JuMP.Model;
+                             variant::AbstractString="",
+                             relaxation::Union{Symbol,AbstractString}="",
+                             digits::Int=6,
+                             mat_digits::Int=6,
+                             tol::Real=1e-9,
+                             show_mats::Bool=true,
+                             show_Z::Bool=false)
+
+    st = termination_status(model)
+
+    obj = nothing
+    try obj = objective_value(model) catch end
+
+    t = nothing
+    try t = JuMP.solve_time(model) catch end
+
+    dict = JuMP.object_dictionary(model)
+
+    has_u = haskey(dict, :u)
+    has_v = haskey(dict, :v)
+
+    family = has_u ? "BigM family" : (has_v ? "Complementarity family" : "Unknown family")
+
+    has_lift = any(haskey(dict, s) for s in (:X, :U, :R, :V, :W, :Z))
+    level = has_lift ? "Lifted" : "EXACT (no lifting)"
 
     println("\n================= RESULT =================")
-    println("status = ", st)
-    println("obj    = ", obj)
-    println("time   = ", t, " sec")
+    println("family     = ", family, " | level = ", level)
+    if variant != "";    println("variant    = ", variant)    end
+    if relaxation != ""; println("relaxation = ", relaxation) end
 
-    if obj === nothing || x === nothing
+    if has_u; println("u type     = ", _var_kind(dict[:u])) end
+    if has_v; println("v type     = ", _var_kind(dict[:v])) end
+
+    println("status     = ", st)
+    println("obj        = ", obj)
+    if t !== nothing
+        println("time       = ", t, " sec")
+    end
+
+    if !(st in (MOI.OPTIMAL, MOI.LOCALLY_SOLVED, MOI.ALMOST_OPTIMAL))
         return nothing
     end
 
-    println("sum(x)      = ", sum(x))
-    println("sum(u)      = ", sum(u))
-    println("nnz(x>1e-6) = ", count(>(1e-6), x))
+    _get(sym::Symbol) = haskey(dict, sym) ? dict[sym] : nothing
+    _val(obj) = obj === nothing ? nothing : value.(obj)
 
-    print_vec("x", x; digits=digits, tol=tol)
-    print_vec("u", u; digits=digits, tol=tol)
+    x = _val(_get(:x))
+    u = _val(_get(:u))
+    v = _val(_get(:v))
+
+    X = _val(_get(:X))
+    U = _val(_get(:U))
+    R = _val(_get(:R))
+
+    V = _val(_get(:V))
+    W = _val(_get(:W))
+
+    Z = _val(_get(:Z))
+
+    if x !== nothing
+        println("sum(x)      = ", sum(x))
+        println("nnz(x>1e-6) = ", count(>(1e-6), x))
+        print_vec("x", x; digits=digits, tol=tol)
+    end
+    if u !== nothing
+        println("sum(u)      = ", sum(u))
+        print_vec("u", u; digits=digits, tol=tol)
+    end
+    if v !== nothing
+        println("sum(v)      = ", sum(v))
+        print_vec("v", v; digits=digits, tol=tol)
+    end
 
     if show_mats
         if X !== nothing; print_mat("X", X; digits=mat_digits, tol=tol) end
         if U !== nothing; print_mat("U", U; digits=mat_digits, tol=tol) end
         if R !== nothing; print_mat("R", R; digits=mat_digits, tol=tol) end
+        if V !== nothing; print_mat("V", V; digits=mat_digits, tol=tol) end
+        if W !== nothing; print_mat("W", W; digits=mat_digits, tol=tol) end
+        if show_Z && Z !== nothing
+            print_mat("Z", Z; digits=mat_digits, tol=tol, max_rows=12, max_cols=12)
+        end
     end
 
     return nothing

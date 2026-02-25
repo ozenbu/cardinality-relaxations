@@ -381,23 +381,69 @@ function solve_RLT_SDP(
     end
 end
 
+# ------------------------------------------------------------------
+# PrettyPrint wrapper (model-based)
+# ------------------------------------------------------------------
+function solve_and_print(
+    data::Dict{String,Any};
+    variant::String = "EU",
+    relaxation::Symbol = :RLT,
+    optimizer = MosekTools.Optimizer,
+    show_mats::Bool = true,
+    show_Z::Bool = false,
+    pp_kwargs...
+)
+    if !isdefined(Main, :PrettyPrint)
+        error("PrettyPrint is not loaded. Please include(\"instances/prettyprint.jl\") before calling RLT_SDP_Combo.solve_and_print.")
+    end
+
+    m = build_RLT_SDP_model(
+        data;
+        variant=variant,
+        optimizer=optimizer,
+        build_only=true,
+        relaxation=relaxation
+    )
+
+    optimize!(m)
+
+    Main.PrettyPrint.print_model_solution(
+        m;
+        variant=variant,
+        relaxation=relaxation,
+        show_mats=show_mats,
+        show_Z=show_Z,
+        pp_kwargs...
+    )
+
+    return m
+end
+
 end # module
 
 
+if isinteractive()
+    # ---- utilities first ----
+    include("instances/prettyprint.jl")
+    using .PrettyPrint
 
-include("instances/alper_stqp_instance.jl")
-include("instances/prettyprint.jl")
+    using .RLTBigM
+    using .SDPBigM
+    using .RLT_SDP_Combo
 
-using .RLT_SDP_Combo
-using .AlperStqpInstances
-using .PrettyPrint
+    # ---- instances ----
+    include("instances/alper_stqp_instance.jl")
+    using .AlperStqpInstances
+    alp_inst = alper_stqp_rho3_instance()
 
-inst = alper_stqp_rho3_instance()
+    include("instances/diff_RLTEU_RLTIU_bigM_instance.jl")
+    using .EUIUdiffinstance
+    diff_inst = euiu_diff_instance()
 
-print_instance(inst; show_mats=true, digits=4)
+    # 1) Alper's instance: RLT + full SDP
+    RLT_SDP_Combo.solve_and_print(alp_inst; variant="E", relaxation=:RLT_full_SDP, show_mats=true, show_Z=false)
 
-st, obj, x, u, X, R, U, t = RLT_SDP_Combo.solve_RLT_SDP(
-    inst; variant="IU", relaxation=:RLT_full_SDP
-)
+    # 2) Diff instance: RLT + full SDP
+    #RLT_SDP_Combo.solve_and_print(diff_inst; variant="EU", relaxation=:RLT_full_SDP, show_mats=true, show_Z=false)
 
-print_solution(st, obj, x, u, X, R, U, t; digits=6, show_mats=true)
+end

@@ -6,7 +6,7 @@ using Parameters
 using MathOptInterface
 const MOI = MathOptInterface
 
-# re-use instance parsing from RLTBigM
+# Re-use instance parsing from RLTBigM
 using ..RLTBigM: prepare_instance
 
 "Add the lifted PSD block"
@@ -85,64 +85,65 @@ function build_SDP_model(data::Dict{String, Any};
     return model
 end
 
-function demo_SDP()
-    println("Setting up SDP demo with test instance...")
-    Q0 = [
-        0.0003   0.1016   0.0316   0.0867;
-        0.1016   0.0020   0.1001   0.1059;
-        0.0316   0.1001  -0.0005  -0.0703;
-        0.0867   0.1059  -0.0703  -0.1063
-    ]
-    Q0 = Q0 * 20000
-    q0 = [-0.1973, -0.2535, -0.1967, -0.0973] * 20000
+"Build -> optimize -> PrettyPrint from the JuMP model (no manual unpack)."
+function solve_and_print(data::Dict{String,Any};
+                         variant::String="E",
+                         relaxation = :SDP,
+                         optimizer=MosekTools.Optimizer,
+                         pp_kwargs...)
 
-    data_test = Dict(
-        "n"   => 4,
-        "rho" => 3.0,
-        "Q0"  => Q0,
-        "q0"  => q0,
-        "Qi"  => nothing, "qi" => nothing, "ri" => nothing,
-        "Pi"  => nothing, "pi" => nothing, "si" => nothing,
-        "A"   => nothing, "b"  => nothing,
-        "H"   => nothing, "h"  => nothing,
-        # Here we use the old-style single M;
-        # internally this becomes Mminus = Mplus = I(4)
-        "M"   => I(4)
-        # If you want asymmetric bounds, you can instead do:
-        # "Mminus" => Diagonal([2.0, 1.0, 1.0, 0.5]),
-        # "Mplus"  => Diagonal([5.0, 3.0, 2.0, 1.0])
+    if !isdefined(Main, :PrettyPrint)
+        error("PrettyPrint is not loaded. Please include(\"instances/prettyprint.jl\") before calling SDPBigM.solve_and_print.")
+    end
+
+    model = build_SDP_model(data; variant=variant, build_only=true, optimizer=optimizer)
+    optimize!(model)
+
+    Main.PrettyPrint.print_model_solution(model;
+        variant=variant,
+        relaxation=relaxation,
+        pp_kwargs...
     )
 
-    for variant in ["E", "I"]
-        println("\n🔹 Solving SDP variant: $variant")
-        model = build_SDP_model(data_test; variant=variant)
+    return model
+end
 
-        optimize!(model)
+"Run both SDP variants (E and I) on a given instance Dict."
+function demo_SDP(instance_data::Dict{String,Any};
+                  optimizer=MosekTools.Optimizer,
+                  show_mats::Bool=true,
+                  show_Z::Bool=false)
 
-        status = termination_status(model)
-        println("Status = ", status)
-
-        if status == MOI.OPTIMAL
-            println("Objective = ", objective_value(model))
-
-            # Access variables by name from the model
-            x_var = model[:x]
-            u_var = model[:u]
-
-            println("x = ", value.(x_var))
-            println("u = ", value.(u_var))
-        else
-            println("Optimization failed for variant $variant")
-        end
+    for variant in ("E", "I")
+        solve_and_print(instance_data;
+            variant=variant,
+            relaxation=:SDP,
+            optimizer=optimizer,
+            show_mats=show_mats,
+            show_Z=show_Z
+        )
     end
+    return nothing
 end
 
 end  # module SDPBigM
 
-#=
-if isinteractive()
-    using .SDPBigM
-    SDPBigM.demo_SDP()
-end
-=#
 
+if isinteractive()
+    include("instances/prettyprint.jl")
+    include("instances/alper_stqp_instance.jl")     # module AlperStqpInstances
+    include("instances/diff_RLTEU_RLTIU_bigM_instance.jl")  # module EUIUdiffinstance
+
+    using .PrettyPrint
+    using .RLTBigM
+    using .SDPBigM
+    using .AlperStqpInstances
+    using .EUIUdiffinstance
+
+    alp_inst  = alper_stqp_rho3_instance()
+    diff_inst = euiu_diff_instance()
+
+    # Run SDP BigM on both stored instances
+    SDPBigM.demo_SDP(alp_inst;  show_mats=true, show_Z=false)
+    #SDPBigM.demo_SDP(diff_inst; show_mats=true, show_Z=false)
+end
