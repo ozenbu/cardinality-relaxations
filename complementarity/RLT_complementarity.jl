@@ -327,6 +327,7 @@ if isinteractive()
     using .PrettyPrint
     # ---- Optimizer ----
     using Gurobi
+    using JuMP
 
     # ---- Instances (from .jl files) ----
     include("instances/alper_stqp_instance.jl")
