@@ -302,20 +302,23 @@ export build_RLT_SDP_comp_model, solve_RLT_SDP_comp, solve_and_print, Relaxation
 end # module
 
 if isinteractive()
-    include("instances/prettyprint.jl")
-    using .PrettyPrint
 
     # Must load these first (dependency chain)
-    include("RLT_bigM_4variants.jl")     # RLTBigM.prepare_instance
-    include("RLT_complementarity.jl")               # add_FC_comp!, add_FE_v!, add_FB_v!, add_FU_v!
+    using ..RLTBigM: prepare_instance
+    using .RLTComp               # add_FC_comp!, add_FE_v!, add_FB_v!, add_FU_v!
 
     using MosekTools
 
-    include("instances/alper_stqp_instance.jl")
+    # ---- PrettyPrint first ----
+    include(normpath(joinpath(@__DIR__, "..", "instances", "prettyprint.jl")))
+    using .PrettyPrint
+
+    # ---- Instances from .jl ----
+    include(normpath(joinpath(@__DIR__, "..", "instances", "alper_stqp_instance.jl")))
     using .AlperStqpInstances
     alp_inst = alper_stqp_rho3_instance()
 
-    include("instances/diff_RLTEU_RLTIU_bigM_instance.jl")
+    include(normpath(joinpath(@__DIR__, "..", "instances", "diff_RLTEU_RLTIU_bigM_instance.jl")))
     using .EUIUdiffinstance
     diff_inst = euiu_diff_instance()
 

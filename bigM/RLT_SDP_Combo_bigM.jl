@@ -424,22 +424,22 @@ end # module
 
 if isinteractive()
     # ---- utilities first ----
-    include("instances/prettyprint.jl")
-    using .PrettyPrint
-
     using .RLTBigM
     using .SDPBigM
     using .RLT_SDP_Combo
 
-    # ---- instances ----
-    include("instances/alper_stqp_instance.jl")
+    # ---- PrettyPrint first ----
+    include(normpath(joinpath(@__DIR__, "..", "instances", "prettyprint.jl")))
+    using .PrettyPrint
+
+    # ---- Instances from .jl ----
+    include(normpath(joinpath(@__DIR__, "..", "instances", "alper_stqp_instance.jl")))
     using .AlperStqpInstances
     alp_inst = alper_stqp_rho3_instance()
 
-    include("instances/diff_RLTEU_RLTIU_bigM_instance.jl")
+    include(normpath(joinpath(@__DIR__, "..", "instances", "diff_RLTEU_RLTIU_bigM_instance.jl")))
     using .EUIUdiffinstance
     diff_inst = euiu_diff_instance()
-
     # 1) Alper's instance: RLT + full SDP
     RLT_SDP_Combo.solve_and_print(alp_inst; variant="E", relaxation=:RLT_full_SDP, show_mats=true, show_Z=false)
 

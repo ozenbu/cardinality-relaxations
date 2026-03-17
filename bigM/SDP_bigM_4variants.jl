@@ -130,17 +130,20 @@ end  # module SDPBigM
 
 
 if isinteractive()
-    include("instances/prettyprint.jl")
-    include("instances/alper_stqp_instance.jl")     # module AlperStqpInstances
-    include("instances/diff_RLTEU_RLTIU_bigM_instance.jl")  # module EUIUdiffinstance
 
-    using .PrettyPrint
     using .RLTBigM
     using .SDPBigM
-    using .AlperStqpInstances
-    using .EUIUdiffinstance
+    # ---- PrettyPrint first ----
+    include(normpath(joinpath(@__DIR__, "..", "instances", "prettyprint.jl")))
+    using .PrettyPrint
 
-    alp_inst  = alper_stqp_rho3_instance()
+    # ---- Instances from .jl ----
+    include(normpath(joinpath(@__DIR__, "..", "instances", "alper_stqp_instance.jl")))
+    using .AlperStqpInstances
+    alp_inst = alper_stqp_rho3_instance()
+
+    include(normpath(joinpath(@__DIR__, "..", "instances", "diff_RLTEU_RLTIU_bigM_instance.jl")))
+    using .EUIUdiffinstance
     diff_inst = euiu_diff_instance()
 
     # Run SDP BigM on both stored instances
