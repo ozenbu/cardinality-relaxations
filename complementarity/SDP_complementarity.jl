@@ -6,12 +6,8 @@ using MosekTools
 using MathOptInterface
 const MOI = MathOptInterface
 
-# Reuse your existing instance prep (must have been loaded before this module)
-using ..RLTBigM: prepare_instance
-
 # ----------------------------
 # PSD lift: Y = [1 x' v'; x X W; v W' V] ⪰ 0
-# (Implemented via a symmetric variable Y with equality linking)
 # ----------------------------
 function add_PSD_comp!(m::Model, x, v, X, V, W; n::Int)
     @variable(m, Y[1:(2n+1), 1:(2n+1)], Symmetric)
@@ -21,7 +17,55 @@ function add_PSD_comp!(m::Model, x, v, X, V, W; n::Int)
 end
 
 # ----------------------------
-# Common constraints (NO ST/RLT equalities)
+# Prepare params (self-contained; supports your instance Dict)
+# ----------------------------
+function prepare_instance_comp_sdp(data::Dict{String,Any})
+    n   = Int(data["n"])
+    ρ   = Int(data["rho"])
+    Q0  = Matrix{Float64}(data["Q0"])
+    q0  = Vector{Float64}(data["q0"])
+
+    Qi  = get(data, "Qi", nothing)
+    qi  = get(data, "qi", nothing)
+    ri  = get(data, "ri", nothing)
+
+    Pi  = get(data, "Pi", nothing)
+    pi  = get(data, "pi", nothing)
+    si  = get(data, "si", nothing)
+
+    A   = get(data, "A", nothing)
+    b   = get(data, "b", nothing)
+    H   = get(data, "H", nothing)
+    h   = get(data, "h", nothing)
+
+    mminus = Vector{Float64}(data["Mminus"])
+    mplus  = Vector{Float64}(data["Mplus"])
+    bigM_scale = Float64(get(data, "bigM_scale", 1.0))
+
+    xL = -bigM_scale .* mminus
+    xU =  bigM_scale .* mplus
+
+    e  = ones(Float64, n)
+
+    hasA = (A isa AbstractMatrix) && (b isa AbstractVector) && (size(A,1) > 0)
+    hasH = (H isa AbstractMatrix) && (h isa AbstractVector) && (size(H,1) > 0)
+
+    ℓ = hasA ? 1 : 0
+    η = hasH ? 1 : 0
+
+    return (
+        n=n, ρ=ρ, Q0=Q0, q0=q0,
+        Qi=Qi, qi=qi, ri=ri,
+        Pi=Pi, pi=pi, si=si,
+        A=A, b=b, ℓ=ℓ,
+        H=H, h=h, η=η,
+        xL=xL, xU=xU,
+        e=e
+    )
+end
+
+# ----------------------------
+# Common constraints (SDP-only; NO ST/RLT equalities)
 # ----------------------------
 function add_common_comp_SDP!(m::Model, x, v, X, V, W, params)
     n  = params.n
@@ -40,31 +84,36 @@ function add_common_comp_SDP!(m::Model, x, v, X, V, W, params)
     H  = params.H
     h  = params.h
     η  = params.η
-    e  = params.e
+    xL = params.xL
+    xU = params.xU
 
     # Objective: 0.5⟨Q0, X⟩ + q0ᵀx
     @objective(m, Min, 0.5 * sum(Q0[i,j]*X[i,j] for i=1:n, j=1:n) + q0' * x)
 
-    # QCQP rows lifted via X
-    for (Qmat, qvec, rterm) in zip(Qi, qi, ri)
-        @constraint(m, 0.5 * sum(Qmat[i,j]*X[i,j] for i=1:n, j=1:n) + qvec' * x + rterm <= 0)
+    # QCQP rows lifted via X (skip if nothing)
+    if Qi !== nothing
+        for (Qmat, qvec, rterm) in zip(Qi, qi, ri)
+            @constraint(m, 0.5 * sum(Qmat[i,j]*X[i,j] for i=1:n, j=1:n) + qvec' * x + rterm <= 0)
+        end
     end
-    for (Pmat, pvec, sterm) in zip(Pi, pi, si)
-        @constraint(m, 0.5 * sum(Pmat[i,j]*X[i,j] for i=1:n, j=1:n) + pvec' * x + sterm == 0)
+    if Pi !== nothing
+        for (Pmat, pvec, sterm) in zip(Pi, pi, si)
+            @constraint(m, 0.5 * sum(Pmat[i,j]*X[i,j] for i=1:n, j=1:n) + pvec' * x + sterm == 0)
+        end
     end
 
     # Linear rows
     if ℓ > 0; @constraint(m, A * x .<= b); end
     if η > 0; @constraint(m, H * x .== h); end
 
-    # Bounds on x (as in your formulations)
-    @constraint(m, 0 .<= x)
-    @constraint(m, x .<= e)
+    # General x-bounds: xL <= x <= xU   (UPDATED)
+    @constraint(m, xL .<= x)
+    @constraint(m, x .<= xU)
 
-    # Cardinality equality
+    # Cardinality equality: e'v = n-ρ
     @constraint(m, sum(v) == n - ρ)
 
-    # Complementarity relaxation in the lift
+    # Relaxed complementarity in the lift: diag(W)=0
     @constraint(m, [i=1:n], W[i,i] == 0)
 
     # PSD lift
@@ -78,19 +127,26 @@ add_binlift_v!(m, v, V, n::Int) = (@constraint(m, [i=1:n], V[i,i] == v[i]); noth
 add_v_box!(m, v, e) = (@constraint(m, 0 .<= v); @constraint(m, v .<= e); nothing)
 
 """
-    build_SDP_comp_model(data; variant="SDP_S2", build_only=false, optimizer=MosekTools.Optimizer, verbose=false)
+    build_SDP_comp_model(data; variant="SDP_CompBin", optimizer=MosekTools.Optimizer, verbose=false)
 
-Variants (reduced to 2, since SDP_S2U is redundant):
-- "SDP_S2": diag(V)=v, no explicit v-box (PSD + diag(V)=v ⇒ 0<=v<=1 automatically)
-- "SDP_S3": explicit 0<=v<=1, no diag(V)=v
+Variants:
+- "SDP_CompBin": diag(V)=v (binary-lift surrogate), no explicit v-box (implied by PSD + diag(V)=v)
+- "SDP_CompBou": explicit 0<=v<=e, no diag(V)=v
+
+Backward-compatible aliases:
+- "SDP_S2" -> "SDP_CompBin"
+- "SDP_S3" -> "SDP_CompBou"
 """
 function build_SDP_comp_model(data::Dict{String,Any};
-    variant::String="SDP_S2",
-    build_only::Bool=false,
+    variant::String="SDP_CompBin",
     optimizer = MosekTools.Optimizer,
     verbose::Bool=false
 )
-    params = prepare_instance(data)
+    # aliases
+    if variant == "SDP_S2"; variant = "SDP_CompBin"; end
+    if variant == "SDP_S3"; variant = "SDP_CompBou"; end
+
+    params = prepare_instance_comp_sdp(data)
     n = params.n
     e = params.e
 
@@ -108,14 +164,14 @@ function build_SDP_comp_model(data::Dict{String,Any};
     add_common_comp_SDP!(m, x, v, X, V, W, params)
 
     # Variant-specific
-    if variant == "SDP_S2"
-        add_binlift_v!(m, v, V, n)
+    if variant == "SDP_CompBin"
+        add_binlift_v!(m, v, V, n)   # diag(V)=v
         # no v-box needed (implied)
-    elseif variant == "SDP_S3"
-        add_v_box!(m, v, e)
+    elseif variant == "SDP_CompBou"
+        add_v_box!(m, v, e)          # 0<=v<=e
         # no diag(V)=v
     else
-        error("Unknown variant: $variant. Use SDP_S2 or SDP_S3.")
+        error("Unknown variant: $variant. Use SDP_CompBin or SDP_CompBou (or SDP_S2/SDP_S3 aliases).")
     end
 
     return m
@@ -123,7 +179,7 @@ end
 
 # PrettyPrint wrapper
 function solve_and_print(data::Dict{String,Any};
-    variant::String="SDP_S2",
+    variant::String="SDP_CompBin",
     optimizer = MosekTools.Optimizer,
     verbose::Bool=false,
     show_mats::Bool=true,
@@ -151,6 +207,7 @@ export build_SDP_comp_model, solve_and_print
 
 end # module SDPComplementarity
 
+
 if isinteractive()
     # ---- PrettyPrint first ----
     include(normpath(joinpath(@__DIR__, "..", "instances", "prettyprint.jl")))
@@ -173,7 +230,7 @@ if isinteractive()
     inst = alp_inst
     #inst = diff_inst
 
-    variants = ("SDP_S2", "SDP_S3")
+    variants = ("SDP_CompBin", "SDP_CompBou")   
 
     println("\n==============================")
     println(" SDP Complementarity ")

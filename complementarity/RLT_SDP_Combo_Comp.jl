@@ -1,17 +1,21 @@
 module RLT_SDP_Comp_Combo
 
 using MosekTools
-using JuMP, LinearAlgebra, Parameters
-const MOI = JuMP.MOI
+using JuMP
+using LinearAlgebra
+using Parameters: @unpack
+using MathOptInterface
+const MOI = MathOptInterface
 
-# Reuse instance parsing (single source of truth)
-using ..RLTBigM: prepare_instance
-
-# Reuse complementarity RLT blocks (no duplication)
-using ..RLTComp: add_FC_comp!, add_FE_v!, add_FB_v!, add_FU_v!
+# ------------------------------------------------------------------
+# Single source of truth:
+# - instance preparation for complementarity (general bounds xL<=x<=xU)
+# - RLT blocks (FC/FE/FB/FU) already updated
+# ------------------------------------------------------------------
+using ..RLTComp: prepare_instance_comp, add_FC_comp!, add_FE_v!, add_FB_v!, add_FU_v!
 
 # --------------------------------------------------------------
-# Relaxation modes (analog of BigM RLT_SDP_Combo, but for (x,v,X,V,W))
+# Relaxation modes (same structure as BigM combo)
 # --------------------------------------------------------------
 const RelaxationModes = (
     :RLT,
@@ -40,13 +44,13 @@ const RelaxationModes = (
     :RLT_blockSDP_V,
     :RLT_blockSDP_XV,
 
-    :RLT_full_SDP,   # moment matrix Y ⪰ 0
+    :RLT_full_SDP,   # full moment matrix Y ⪰ 0
 )
 
 all_pairs(n::Int) = [(i,j) for i in 1:n for j in i+1:n]
 
 # ==============================================================
-# Generic strengthening blocks (no duplication between X and V)
+# Generic strengthening blocks (re-used for X and/or V)
 # ==============================================================
 
 # 1) diag 2x2 SOC: Zii ≥ zi^2   via RSOC [Zii, 0.5, zi]
@@ -72,9 +76,7 @@ end
 function add_SOC_directional_core!(m::Model, z, Z)
     n = length(z)
     for i in 1:n, j in i+1:n
-        # d = e_i + e_j
         @constraint(m, [Z[i,i] + 2*Z[i,j] + Z[j,j], 0.5, z[i] + z[j]] in MOI.RotatedSecondOrderCone(3))
-        # d = e_i - e_j
         @constraint(m, [Z[i,i] - 2*Z[i,j] + Z[j,j], 0.5, z[i] - z[j]] in MOI.RotatedSecondOrderCone(3))
     end
     return nothing
@@ -124,27 +126,38 @@ end
 # ==============================================================
 
 """
-    build_RLT_SDP_comp_model(data; variant="RLT_S2U", relaxation=:RLT, optimizer, build_only=false)
+    build_RLT_SDP_comp_model(data; variant="RLT_CompBinBou", relaxation=:RLT, optimizer)
 
-Variants (same naming as your complementarity RLT family):
-- "RLT_S2"   : FC_comp + FE_v + FB_v
-- "RLT_S2U"  : FC_comp + FE_v + FB_v + FU_v
-- "RLT_S3"   : FC_comp + FE_v + FU_v
+Variants (preferred naming):
+- "RLT_CompBin"      : FC_comp + FE_v + FB_v
+- "RLT_CompBinBou"   : FC_comp + FE_v + FB_v + FU_v
+- "RLT_CompBou"      : FC_comp + FE_v + FU_v
+
+Backward-compatible aliases:
+- "RLT_S2"  -> "RLT_CompBin"
+- "RLT_S2U" -> "RLT_CompBinBou"
+- "RLT_S3"  -> "RLT_CompBou"
 """
 function build_RLT_SDP_comp_model(
     data::Dict{String,Any};
-    variant::String="RLT_S2U",
+    variant::String="RLT_CompBinBou",
     optimizer = MosekTools.Optimizer,
     build_only::Bool=false,
     relaxation::Symbol = :RLT,
+    verbose::Bool=false
 )
     @assert relaxation in RelaxationModes "Unknown relaxation mode: $relaxation"
 
-    base   = prepare_instance(data)
-    params = merge(base, (eeT = ones(base.n, base.n),))  # needed by RLTComp blocks
+    # aliases
+    if variant == "RLT_S2";  variant = "RLT_CompBin"; end
+    if variant == "RLT_S2U"; variant = "RLT_CompBinBou"; end
+    if variant == "RLT_S3";  variant = "RLT_CompBou"; end
+
+    params = prepare_instance_comp(data)  # includes eeT, xL, xU, etc.
     @unpack n, ρ, Q0, q0 = params
 
     m = Model(optimizer)
+    verbose ? nothing : set_silent(m)
 
     # Decision variables (names match PrettyPrint auto-detection)
     @variable(m, x[1:n])
@@ -153,27 +166,27 @@ function build_RLT_SDP_comp_model(
     @variable(m, V[1:n,1:n], Symmetric)
     @variable(m, W[1:n,1:n])
 
-    # Objective consistent with your RLTComp/SDPComp: 0.5⟨Q0,X⟩ + q0ᵀx
+    # Objective: 0.5⟨Q0,X⟩ + q0ᵀx
     @objective(m, Min, 0.5 * sum(Q0[i,j]*X[i,j] for i=1:n, j=1:n) + q0' * x)
 
     # ---- Base RLT blocks from complementarity side ----
     add_FC_comp!(m, x, v, X, V, W, params)
     add_FE_v!(m, x, v, X, V, W, params)
 
-    if variant == "RLT_S2"
+    if variant == "RLT_CompBin"
         add_FB_v!(m, v, V, params)
-    elseif variant == "RLT_S2U"
+    elseif variant == "RLT_CompBinBou"
         add_FB_v!(m, v, V, params)
         add_FU_v!(m, x, v, X, V, W, params)
-    elseif variant == "RLT_S3"
+    elseif variant == "RLT_CompBou"
         add_FU_v!(m, x, v, X, V, W, params)
     else
-        error("Unknown variant: $variant. Use RLT_S2, RLT_S2U, or RLT_S3.")
+        error("Unknown variant: $variant. Use RLT_CompBin, RLT_CompBinBou, or RLT_CompBou.")
     end
 
     # ---- Strengthening on top of RLT ----
     if relaxation == :RLT
-        # nothing
+        nothing
 
     elseif relaxation == :RLT_SOC2x2_diag_X
         add_SOC2x2_diag!(m, x, X)
@@ -228,16 +241,16 @@ function build_RLT_SDP_comp_model(
 end
 
 # ==============================================================
-# PrettyPrint wrapper (model-based, like BigM side)
+# PrettyPrint wrapper (model-based)
 # ==============================================================
 
 function solve_and_print(
     data::Dict{String,Any};
-    variant::String="RLT_S2U",
+    variant::String="RLT_CompBinBou",
     relaxation::Symbol=:RLT,
     optimizer = MosekTools.Optimizer,
+    verbose::Bool=false,
     show_mats::Bool=true,
-    show_Y::Bool=false,
     pp_kwargs...
 )
     if !isdefined(Main, :PrettyPrint)
@@ -248,13 +261,12 @@ function solve_and_print(
         variant=variant,
         relaxation=relaxation,
         optimizer=optimizer,
-        build_only=true
+        build_only=true,
+        verbose=verbose
     )
 
     optimize!(m)
 
-    # If you want to show the moment matrix, PrettyPrint can print it only if named.
-    # Here we don't force-print Y; we just pass show_mats and the model already contains x,v,X,V,W (and Y if full SDP).
     Main.PrettyPrint.print_model_solution(
         m;
         variant=variant,
@@ -267,17 +279,17 @@ function solve_and_print(
 end
 
 # --------------------------------------------------------------
-# Solve wrapper (compatible with BigM-side batch code pattern)
-# Returns: (status, obj, x, v, X, V, W, time_sec)
+# Solve wrapper (returns values + time)
 # --------------------------------------------------------------
 function solve_RLT_SDP_comp(
     data::Dict{String,Any};
-    variant::String="RLT_S2U",
+    variant::String="RLT_CompBinBou",
     optimizer = MosekTools.Optimizer,
     relaxation::Symbol = :RLT,
+    verbose::Bool=false
 )
     m = build_RLT_SDP_comp_model(
-        data; variant=variant, optimizer=optimizer, relaxation=relaxation
+        data; variant=variant, optimizer=optimizer, relaxation=relaxation, verbose=verbose
     )
 
     t0 = time_ns()
@@ -299,32 +311,27 @@ end
 
 export build_RLT_SDP_comp_model, solve_RLT_SDP_comp, solve_and_print, RelaxationModes
 
-end # module
+end # module RLT_SDP_Comp_Combo
 
+# ==============================================================
+# Interactive demo (optional)
+# ==============================================================
 if isinteractive()
-
-    # Must load these first (dependency chain)
-    using ..RLTBigM: prepare_instance
-    using .RLTComp               # add_FC_comp!, add_FE_v!, add_FB_v!, add_FU_v!
-
     using MosekTools
 
-    # ---- PrettyPrint first ----
     include(normpath(joinpath(@__DIR__, "..", "instances", "prettyprint.jl")))
     using .PrettyPrint
 
-    # ---- Instances from .jl ----
     include(normpath(joinpath(@__DIR__, "..", "instances", "alper_stqp_instance.jl")))
     using .AlperStqpInstances
-    alp_inst = alper_stqp_rho3_instance()
+    inst = alper_stqp_rho3_instance()
 
-    include(normpath(joinpath(@__DIR__, "..", "instances", "diff_RLTEU_RLTIU_bigM_instance.jl")))
-    using .EUIUdiffinstance
-    diff_inst = euiu_diff_instance()
-
-    inst = alp_inst
-    #inst = diff_inst
-
-    RLT_SDP_Comp_Combo.solve_and_print(inst; variant="RLT_S3", relaxation=:RLT_full_SDP, optimizer=MosekTools.Optimizer)
-    # RLT_SDP_Comp_Combo.solve_and_print(inst; variant="RLT_S2",  relaxation=:RLT_blockSDP_XV, optimizer=MosekTools.Optimizer)
+    # Example calls:
+    RLT_SDP_Comp_Combo.solve_and_print(
+        inst;
+        variant="RLT_CompBou",
+        relaxation=:RLT_full_SDP,
+        optimizer=MosekTools.Optimizer,
+        show_mats=true
+    )
 end
