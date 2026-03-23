@@ -133,7 +133,6 @@ Variants:
 - "SDP_CompBin": diag(V)=v (binary-lift surrogate), no explicit v-box (implied by PSD + diag(V)=v)
 - "SDP_CompBou": explicit 0<=v<=e, no diag(V)=v
 
-Backward-compatible aliases:
 - "SDP_S2" -> "SDP_CompBin"
 - "SDP_S3" -> "SDP_CompBou"
 """

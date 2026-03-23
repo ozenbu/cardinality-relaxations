@@ -418,7 +418,7 @@ if isinteractive()
 
     # ---- Instances from .jl ----
     include(normpath(joinpath(@__DIR__, "..", "instances", "alper_stqp_instance.jl")))
-    using .AlperStqpInstances
+    using .AlperStqpInstances  
     alp_inst = alper_stqp_rho3_instance()
 
     include(normpath(joinpath(@__DIR__, "..", "instances", "diff_RLTEU_RLTIU_bigM_instance.jl")))

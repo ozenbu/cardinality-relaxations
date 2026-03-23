@@ -3,12 +3,15 @@ module RLT_SDP_Batch
 using JSON, CSV
 using JuMP, MosekTools, LinearAlgebra
 using OrderedCollections: OrderedDict
+using MathOptInterface
+const MOI = MathOptInterface
 
 using Main.RLT_SDP_Combo: solve_RLT_SDP, RelaxationModes
 using Main.RLT_SDP_Comp_Combo: build_RLT_SDP_comp_model, RelaxationModes as RelaxationModesComp
 
-const MOI = JuMP.MOI
-
+# ------------------------
+# Basic coercions
+# ------------------------
 _as_float(x) = x isa Number ? Float64(x) : throw(ArgumentError("Expected number, got $(typeof(x))"))
 _as_vec(x)   = x === nothing ? nothing : Float64.(collect(x))
 
@@ -26,6 +29,7 @@ function _as_mat_with_n(x, n::Int)
         M = Float64.(x)
         return size(M,2) == n ? M : (size(M,1) == n ? M' : error("bad shape $(size(M)) for n=$n"))
     elseif x isa AbstractVector
+        # JSON often gives matrices as Vector{Vector}
         @assert !isempty(x) && x[1] isa AbstractVector
         rows = [permutedims(Float64.(v)) for v in x]
         Mrow = reduce(vcat, rows)
@@ -36,7 +40,8 @@ function _as_mat_with_n(x, n::Int)
     end
 end
 
-_as_tuple_vec(x) = x === nothing ? nothing : (x isa Tuple ? x : Tuple(x)) .|> v -> Float64.(collect(v))
+_as_tuple_vec(x) = x === nothing ? nothing :
+    (x isa Tuple ? x : Tuple(x)) .|> v -> Float64.(collect(v))
 
 function _as_tuple_mat(x, n::Int)
     x === nothing && return nothing
@@ -44,27 +49,86 @@ function _as_tuple_mat(x, n::Int)
     return Tuple(_as_mat_with_n(M, n) for M in xs)
 end
 
-_as_tuple_num(x) = x === nothing ? nothing : (x isa Tuple ? x : Tuple(x)) .|> _as_float
+_as_tuple_num(x) = x === nothing ? nothing :
+    (x isa Tuple ? x : Tuple(x)) .|> _as_float
 
+# ------------------------
+# Big-M helpers: accept vector or diagonal matrix; return diagonal vector
+# ------------------------
+function _as_diagvec(x, n::Int; name::String="M")
+    x === nothing && return nothing
+
+    if x isa AbstractVector
+        v = Float64.(collect(x))
+        length(v) == n || error("$name must have length n=$n, got length=$(length(v))")
+        return v
+
+    elseif x isa Diagonal
+        v = Float64.(diag(x))
+        length(v) == n || error("$name size mismatch, need n=$n")
+        return v
+
+    elseif x isa AbstractMatrix
+        M = Float64.(x)
+        size(M,1) == n && size(M,2) == n || error("$name must be n×n, got $(size(M))")
+
+        # Require diagonal (avoid silently ignoring off-diagonals)
+        off = M .- Diagonal(diag(M))
+        maximum(abs.(off)) ≤ 1e-12 || error("$name must be diagonal.")
+        return Float64.(diag(M))
+
+    else
+        error("Unsupported type for $name: $(typeof(x))")
+    end
+end
+
+# Pull the first existing key among candidates
+function _get_any(d::Dict{String,Any}, keys::Tuple{Vararg{String}})
+    for k in keys
+        if haskey(d, k) && d[k] !== nothing
+            return d[k]
+        end
+    end
+    return nothing
+end
+
+# ------------------------
+# Normalizer: makes instances compatible with BOTH BigM + Comp pipelines
+# - Supports either (M_minus,M_plus) OR single M
+# - Accepts vector or diagonal matrix
+# - Writes BOTH naming styles:
+#     underscore: M_minus, M_plus
+#     camel:      Mminus, Mplus
+# - Also keeps/creates M (legacy symmetric)
+# ------------------------
 function normalize_instance!(d::Dict{String,Any})
     @assert haskey(d,"n")
     d["n"] = Int(d["n"])
     n = d["n"]
 
-    haskey(d,"rho") && (d["rho"] = _as_float(d["rho"]))
+    # rho as Int (cardinality)
+    if haskey(d, "rho") && d["rho"] !== nothing
+        d["rho"] = Int(round(_as_float(d["rho"])))
+    end
 
+    # bigM_scale default
+    d["bigM_scale"] = Float64(get(d, "bigM_scale", 1.0))
+
+    # Matrices (n×n)
     for k in ("Q0","A","H")
         if haskey(d,k) && d[k] !== nothing
             d[k] = _as_mat_with_n(d[k], n)
         end
     end
 
+    # Vectors
     for k in ("q0","b","h")
         if haskey(d,k) && d[k] !== nothing
             d[k] = _as_vec(d[k])
         end
     end
 
+    # Quadratic constraints bundles (may be nothing)
     d["Qi"] = _as_tuple_mat(get(d,"Qi", nothing), n)
     d["Pi"] = _as_tuple_mat(get(d,"Pi", nothing), n)
     d["qi"] = _as_tuple_vec(get(d,"qi", nothing))
@@ -72,15 +136,51 @@ function normalize_instance!(d::Dict{String,Any})
     d["ri"] = _as_tuple_num(get(d,"ri", nothing))
     d["si"] = _as_tuple_num(get(d,"si", nothing))
 
-    if haskey(d,"M") && d["M"] !== nothing
-        d["M"] = _as_vec(d["M"])
+    # ------------------------
+    # Unified Big-M handling (NO DEFAULTS)
+    # ------------------------
+    mminus_raw = _get_any(d, ("M_minus", "Mminus"))
+    mplus_raw  = _get_any(d, ("M_plus",  "Mplus"))
+    m_raw      = _get_any(d, ("M",))
+
+    has_pair   = (mminus_raw !== nothing) || (mplus_raw !== nothing)
+    has_single = (m_raw !== nothing)
+
+    if has_pair
+        (mminus_raw !== nothing && mplus_raw !== nothing) ||
+            error("Instance $(get(d, "id", "(no id)")): provide both M_minus and M_plus (or Mminus and Mplus), or provide only M.")
+            
+        mminus = _as_diagvec(mminus_raw, n; name="M_minus")
+        mplus  = _as_diagvec(mplus_raw,  n; name="M_plus")
+
+        # canonical storage (both styles)
+        d["M_minus"] = mminus
+        d["M_plus"]  = mplus
+        d["Mminus"]  = mminus
+        d["Mplus"]   = mplus
+
+        # optional legacy symmetric M (for older code paths)
+        d["M"] = max.(mminus, mplus)
+
+    elseif has_single
+        m = _as_diagvec(m_raw, n; name="M")
+
+        d["M"]       = m
+        d["M_minus"] = copy(m)
+        d["M_plus"]  = copy(m)
+        d["Mminus"]  = copy(m)
+        d["Mplus"]   = copy(m)
+
     else
-        d["M"] = ones(Float64, n)
+        error("Instance $inst_id: missing Big-M data. Provide either (M_minus & M_plus) or a single M.")
     end
 
     return d
 end
 
+# ------------------------
+# Exact callback wrapper
+# ------------------------
 function _get_exact(data::Dict{String,Any}; exact_cb=nothing)
     if exact_cb === nothing
         return ("MISSING", missing, nothing, missing)
@@ -99,8 +199,12 @@ function _get_exact(data::Dict{String,Any}; exact_cb=nothing)
     end
 end
 
-_is_good_status(st::MOI.TerminationStatusCode) = st in (MOI.OPTIMAL, MOI.ALMOST_OPTIMAL, MOI.LOCALLY_SOLVED)
+_is_good_status(st::MOI.TerminationStatusCode) =
+    st in (MOI.OPTIMAL, MOI.ALMOST_OPTIMAL, MOI.LOCALLY_SOLVED)
 
+# ------------------------
+# Solve Comp model (one mode)
+# ------------------------
 function _solve_comp(data::Dict{String,Any};
                      variant::String,
                      optimizer = MosekTools.Optimizer,
@@ -121,6 +225,9 @@ function _solve_comp(data::Dict{String,Any};
     return st, obj, t
 end
 
+# ------------------------
+# Analyze one instance: BigM family (EU/IU)
+# ------------------------
 function analyze_instance(data::Dict{String,Any};
                           modes = RelaxationModes,
                           optimizer = MosekTools.Optimizer,
@@ -129,37 +236,26 @@ function analyze_instance(data::Dict{String,Any};
     exact_status, exact_obj, exact_x, exact_time = _get_exact(data; exact_cb=exact_cb)
 
     rows = NamedTuple[]
-
     for md in modes
         println(inst_label == "" ? ">>> solving relaxation = $(md)"
                                  : ">>> [$(inst_label)] solving relaxation = $(md)")
 
         stE, objE, _, _, _, _, _, tE = solve_RLT_SDP(
-            data;
-            variant    = "EU",
-            optimizer  = optimizer,
-            relaxation = md,
+            data; variant="EU", optimizer=optimizer, relaxation=md,
         )
-
         stI, objI, _, _, _, _, _, tI = solve_RLT_SDP(
-            data;
-            variant    = "IU",
-            optimizer  = optimizer,
-            relaxation = md,
+            data; variant="IU", optimizer=optimizer, relaxation=md,
         )
-
-        EU_gap = gap_pct(objE, exact_obj)
-        IU_gap = gap_pct(objI, exact_obj)
 
         push!(rows, (
             mode        = String(md),
             EU_status   = string(stE),
             EU_obj      = (objE === nothing ? missing : objE),
-            EU_gap      = EU_gap,
+            EU_gap      = gap_pct(objE, exact_obj),
             EU_time_sec = tE,
             IU_status   = string(stI),
             IU_obj      = (objI === nothing ? missing : objI),
-            IU_gap      = IU_gap,
+            IU_gap      = gap_pct(objI, exact_obj),
             IU_time_sec = tI,
         ))
     end
@@ -173,6 +269,9 @@ function analyze_instance(data::Dict{String,Any};
     return rows, exact_block
 end
 
+# ------------------------
+# Analyze one instance: Complementarity family (CompBin / CompBinBou / CompBou)
+# ------------------------
 function analyze_instance_comp(data::Dict{String,Any};
                                modes = RelaxationModesComp,
                                optimizer = MosekTools.Optimizer,
@@ -182,32 +281,31 @@ function analyze_instance_comp(data::Dict{String,Any};
     exact_status, exact_obj, exact_x, exact_time = _get_exact(data; exact_cb=exact_cb)
 
     rows = NamedTuple[]
-
     for md in modes
         println(inst_label == "" ? ">>> solving relaxation = $(md)"
                                  : ">>> [$(inst_label)] solving relaxation = $(md)")
 
-        st2,  obj2,  t2  = _solve_comp(data; variant="RLT_S2",  optimizer=optimizer, relaxation=md)
-        st2u, obj2u, t2u = _solve_comp(data; variant="RLT_S2U", optimizer=optimizer, relaxation=md)
-        st3,  obj3,  t3  = _solve_comp(data; variant="RLT_S3",  optimizer=optimizer, relaxation=md)
+        stB,  objB,  tB  = _solve_comp(data; variant="RLT_CompBin",     optimizer=optimizer, relaxation=md)
+        stBU, objBU, tBU = _solve_comp(data; variant="RLT_CompBinBou",  optimizer=optimizer, relaxation=md)
+        stBo, objBo, tBo = _solve_comp(data; variant="RLT_CompBou",     optimizer=optimizer, relaxation=md)
 
         push!(rows, (
-            mode         = String(md),
+            mode               = String(md),
 
-            S2_status    = string(st2),
-            S2_obj       = (obj2 === nothing ? missing : obj2),
-            S2_gap       = gap_pct(obj2, exact_obj),
-            S2_time_sec  = t2,
+            CompBin_status     = string(stB),
+            CompBin_obj        = (objB === nothing ? missing : objB),
+            CompBin_gap        = gap_pct(objB, exact_obj),
+            CompBin_time_sec   = tB,
 
-            S2U_status   = string(st2u),
-            S2U_obj      = (obj2u === nothing ? missing : obj2u),
-            S2U_gap      = gap_pct(obj2u, exact_obj),
-            S2U_time_sec = t2u,
+            CompBinBou_status  = string(stBU),
+            CompBinBou_obj     = (objBU === nothing ? missing : objBU),
+            CompBinBou_gap     = gap_pct(objBU, exact_obj),
+            CompBinBou_time_sec= tBU,
 
-            S3_status    = string(st3),
-            S3_obj       = (obj3 === nothing ? missing : obj3),
-            S3_gap       = gap_pct(obj3, exact_obj),
-            S3_time_sec  = t3,
+            CompBou_status     = string(stBo),
+            CompBou_obj        = (objBo === nothing ? missing : objBo),
+            CompBou_gap        = gap_pct(objBo, exact_obj),
+            CompBou_time_sec   = tBo,
         ))
     end
 
@@ -217,10 +315,12 @@ function analyze_instance_comp(data::Dict{String,Any};
         "exact_x"        => (exact_x === nothing ? nothing : collect(exact_x)),
         "exact_time_sec" => exact_time
     )
-
     return rows, exact_block
 end
 
+# ------------------------
+# Batch: BigM family
+# ------------------------
 function run_batch(instances_json::AbstractString;
                    out_csv::AbstractString="batch_results.csv",
                    out_json::AbstractString="batch_results.json",
@@ -242,11 +342,7 @@ function run_batch(instances_json::AbstractString;
         println("==============================")
 
         rows, exact_block = analyze_instance(
-            data;
-            modes      = modes,
-            optimizer  = optimizer,
-            exact_cb   = exact_cb,
-            inst_label = inst_label,
+            data; modes=modes, optimizer=optimizer, exact_cb=exact_cb, inst_label=inst_label,
         )
 
         for r in rows
@@ -305,6 +401,9 @@ function run_batch(instances_json::AbstractString;
     return (csv = out_csv, json = out_json, count = length(insts))
 end
 
+# ------------------------
+# Batch: Complementarity family
+# ------------------------
 function run_batch_comp(instances_json::AbstractString;
                         out_csv::AbstractString="batch_comp_results.csv",
                         out_json::AbstractString="batch_comp_results.json",
@@ -326,40 +425,36 @@ function run_batch_comp(instances_json::AbstractString;
         println("==============================")
 
         rows, exact_block = analyze_instance_comp(
-            data;
-            modes      = modes,
-            optimizer  = optimizer,
-            exact_cb   = exact_cb,
-            inst_label = inst_label,
+            data; modes=modes, optimizer=optimizer, exact_cb=exact_cb, inst_label=inst_label,
         )
 
         for r in rows
             push!(all_rows, (
-                inst_id        = k,
-                inst_label     = inst_label,
-                n              = get(data,"n",missing),
-                rho            = get(data,"rho",missing),
+                inst_id            = k,
+                inst_label         = inst_label,
+                n                  = get(data,"n",missing),
+                rho                = get(data,"rho",missing),
 
-                mode           = r.mode,
+                mode               = r.mode,
 
-                S2_status      = r.S2_status,
-                S2_obj         = r.S2_obj,
-                S2_gap         = r.S2_gap,
-                S2_time_sec    = r.S2_time_sec,
+                CompBin_status     = r.CompBin_status,
+                CompBin_obj        = r.CompBin_obj,
+                CompBin_gap        = r.CompBin_gap,
+                CompBin_time_sec   = r.CompBin_time_sec,
 
-                S2U_status     = r.S2U_status,
-                S2U_obj        = r.S2U_obj,
-                S2U_gap        = r.S2U_gap,
-                S2U_time_sec   = r.S2U_time_sec,
+                CompBinBou_status  = r.CompBinBou_status,
+                CompBinBou_obj     = r.CompBinBou_obj,
+                CompBinBou_gap     = r.CompBinBou_gap,
+                CompBinBou_time_sec= r.CompBinBou_time_sec,
 
-                S3_status      = r.S3_status,
-                S3_obj         = r.S3_obj,
-                S3_gap         = r.S3_gap,
-                S3_time_sec    = r.S3_time_sec,
+                CompBou_status     = r.CompBou_status,
+                CompBou_obj        = r.CompBou_obj,
+                CompBou_gap        = r.CompBou_gap,
+                CompBou_time_sec   = r.CompBou_time_sec,
 
-                exact_status   = exact_block["exact_status"],
-                exact_obj      = exact_block["exact_obj"],
-                exact_time_sec = exact_block["exact_time_sec"]
+                exact_status       = exact_block["exact_status"],
+                exact_obj          = exact_block["exact_obj"],
+                exact_time_sec     = exact_block["exact_time_sec"]
             ))
         end
 
@@ -373,22 +468,22 @@ function run_batch_comp(instances_json::AbstractString;
             "exact_x"        => exact_block["exact_x"],
             "exact_time_sec" => exact_block["exact_time_sec"],
             "relaxations"    => [OrderedDict(
-                "mode"        => r.mode,
+                "mode"                  => r.mode,
 
-                "S2_status"   => r.S2_status,
-                "S2_obj"      => r.S2_obj,
-                "S2_gap (%)"  => r.S2_gap,
-                "S2_time_sec" => r.S2_time_sec,
+                "CompBin_status"        => r.CompBin_status,
+                "CompBin_obj"           => r.CompBin_obj,
+                "CompBin_gap (%)"       => r.CompBin_gap,
+                "CompBin_time_sec"      => r.CompBin_time_sec,
 
-                "S2U_status"   => r.S2U_status,
-                "S2U_obj"      => r.S2U_obj,
-                "S2U_gap (%)"  => r.S2U_gap,
-                "S2U_time_sec" => r.S2U_time_sec,
+                "CompBinBou_status"     => r.CompBinBou_status,
+                "CompBinBou_obj"        => r.CompBinBou_obj,
+                "CompBinBou_gap (%)"    => r.CompBinBou_gap,
+                "CompBinBou_time_sec"   => r.CompBinBou_time_sec,
 
-                "S3_status"   => r.S3_status,
-                "S3_obj"      => r.S3_obj,
-                "S3_gap (%)"  => r.S3_gap,
-                "S3_time_sec" => r.S3_time_sec,
+                "CompBou_status"        => r.CompBou_status,
+                "CompBou_obj"           => r.CompBou_obj,
+                "CompBou_gap (%)"       => r.CompBou_gap,
+                "CompBou_time_sec"      => r.CompBou_time_sec,
             ) for r in rows]
         ))
     end
@@ -401,9 +496,14 @@ function run_batch_comp(instances_json::AbstractString;
     return (csv = out_csv, json = out_json, count = length(insts))
 end
 
+export normalize_instance!, run_batch, run_batch_comp, gap_pct
+
 end # module RLT_SDP_Batch
 
 
+# ============================================================
+# Plotting utilities (updated to CompBin naming)
+# ============================================================
 module PlotGradualSDP
 
 using CSV, DataFrames, Plots
@@ -445,18 +545,12 @@ function plot_instance(df::DataFrame, inst_id::Int; outdir::AbstractString = "pl
     mkpath(outdir)
 
     sub = df[df.inst_id .== inst_id, :]
-    if nrow(sub) == 0
-        @warn "No rows for inst_id = $inst_id"
-        return nothing
-    end
+    nrow(sub) == 0 && (@warn "No rows for inst_id = $inst_id"; return nothing)
 
     sub[!, :mode_str] = String.(sub.mode)
     RelaxationSet = Set(RelaxationOrder)
     sub = sub[[m in RelaxationSet for m in sub.mode_str], :]
-    if nrow(sub) == 0
-        @warn "No known modes for inst_id = $inst_id"
-        return nothing
-    end
+    nrow(sub) == 0 && (@warn "No known modes for inst_id = $inst_id"; return nothing)
 
     k     = nrow(sub)
     modes = copy(sub.mode_str)
@@ -467,7 +561,6 @@ function plot_instance(df::DataFrame, inst_id::Int; outdir::AbstractString = "pl
 
     for (idx, row) in enumerate(eachrow(sub))
         ex = row.exact_obj
-
         EU_gap[idx] = (row.EU_status in GOOD_STATUS) ? _gap_to_nan(row.EU_obj, ex) : NaN
         IU_gap[idx] = (row.IU_status in GOOD_STATUS) ? _gap_to_nan(row.IU_obj, ex) : NaN
 
@@ -481,18 +574,8 @@ function plot_instance(df::DataFrame, inst_id::Int; outdir::AbstractString = "pl
         times[idx] = t
     end
 
-    sort_key = similar(EU_gap)
-    for i in 1:k
-        g = EU_gap[i]
-        sort_key[i] = isnan(g) ? -Inf : g
-    end
-
-    perm   = sortperm(sort_key; rev = true)
-    EU_gap = EU_gap[perm]
-    IU_gap = IU_gap[perm]
-    times  = times[perm]
-    modes  = modes[perm]
-
+    perm = sortperm([isnan(g) ? -Inf : g for g in EU_gap]; rev=true)
+    EU_gap, IU_gap, times, modes = EU_gap[perm], IU_gap[perm], times[perm], modes[perm]
     x = collect(1:k)
 
     n   = sub.n[1]
@@ -512,7 +595,6 @@ function plot_instance(df::DataFrame, inst_id::Int; outdir::AbstractString = "pl
         size      = (1200, 600),
         margin    = 20mm,
     )
-
     plot!(p, x, IU_gap; marker=:diamond, linestyle=:solid, label="IU gap")
 
     finite_times = filter(!isnan, times)
@@ -526,10 +608,10 @@ function plot_instance(df::DataFrame, inst_id::Int; outdir::AbstractString = "pl
         label     = "time",
         legend    = :topright,
         ylims     = (0, ymax),
+        color     = :deeppink,
     )
 
     title!(p, "instance $label (n=$n, ρ=$rho)")
-
     outpath = joinpath(outdir, "inst_$(label).png")
     savefig(p, outpath)
     display(p)
@@ -538,8 +620,7 @@ end
 
 function plot_all_instances(path::AbstractString; outdir::AbstractString = "plots")
     df = load_results(path)
-    ids = sort(unique(df.inst_id))
-    for id in ids
+    for id in sort(unique(df.inst_id))
         @info "Plotting inst_id $id"
         plot_instance(df, id; outdir=outdir)
     end
@@ -550,60 +631,43 @@ function plot_instance_comp(df::DataFrame, inst_id::Int; outdir::AbstractString 
     mkpath(outdir)
 
     sub = df[df.inst_id .== inst_id, :]
-    if nrow(sub) == 0
-        @warn "No rows for inst_id = $inst_id"
-        return nothing
-    end
+    nrow(sub) == 0 && (@warn "No rows for inst_id = $inst_id"; return nothing)
 
     sub[!, :mode_str] = String.(sub.mode)
     RelaxationSet = Set(RelaxationOrderComp)
     sub = sub[[m in RelaxationSet for m in sub.mode_str], :]
-    if nrow(sub) == 0
-        @warn "No known modes for inst_id = $inst_id"
-        return nothing
-    end
+    nrow(sub) == 0 && (@warn "No known modes for inst_id = $inst_id"; return nothing)
 
     k     = nrow(sub)
     modes = copy(sub.mode_str)
 
-    S2_gap  = Vector{Float64}(undef, k)
-    S2U_gap = Vector{Float64}(undef, k)
-    S3_gap  = Vector{Float64}(undef, k)
+    B_gap   = Vector{Float64}(undef, k)   # CompBin
+    BU_gap  = Vector{Float64}(undef, k)   # CompBinBou
+    Bo_gap  = Vector{Float64}(undef, k)   # CompBou
     times   = Vector{Float64}(undef, k)
 
     for (idx, row) in enumerate(eachrow(sub))
         ex = row.exact_obj
 
-        S2_gap[idx]  = (row.S2_status  in GOOD_STATUS) ? _gap_to_nan(row.S2_obj,  ex) : NaN
-        S2U_gap[idx] = (row.S2U_status in GOOD_STATUS) ? _gap_to_nan(row.S2U_obj, ex) : NaN
-        S3_gap[idx]  = (row.S3_status  in GOOD_STATUS) ? _gap_to_nan(row.S3_obj,  ex) : NaN
+        B_gap[idx]  = (row.CompBin_status in GOOD_STATUS) ? _gap_to_nan(row.CompBin_obj, ex) : NaN
+        BU_gap[idx] = (row.CompBinBou_status in GOOD_STATUS) ? _gap_to_nan(row.CompBinBou_obj, ex) : NaN
+        Bo_gap[idx] = (row.CompBou_status in GOOD_STATUS) ? _gap_to_nan(row.CompBou_obj, ex) : NaN
 
         t = NaN
-        if row.S2_status in GOOD_STATUS && !ismissing(row.S2_time_sec)
-            t = row.S2_time_sec
+        if row.CompBin_status in GOOD_STATUS && !ismissing(row.CompBin_time_sec)
+            t = row.CompBin_time_sec
         end
-        if row.S2U_status in GOOD_STATUS && !ismissing(row.S2U_time_sec)
-            t = isnan(t) ? row.S2U_time_sec : max(t, row.S2U_time_sec)
+        if row.CompBinBou_status in GOOD_STATUS && !ismissing(row.CompBinBou_time_sec)
+            t = isnan(t) ? row.CompBinBou_time_sec : max(t, row.CompBinBou_time_sec)
         end
-        if row.S3_status in GOOD_STATUS && !ismissing(row.S3_time_sec)
-            t = isnan(t) ? row.S3_time_sec : max(t, row.S3_time_sec)
+        if row.CompBou_status in GOOD_STATUS && !ismissing(row.CompBou_time_sec)
+            t = isnan(t) ? row.CompBou_time_sec : max(t, row.CompBou_time_sec)
         end
         times[idx] = t
     end
 
-    sort_key = similar(S2U_gap)
-    for i in 1:k
-        g = S2U_gap[i]
-        sort_key[i] = isnan(g) ? -Inf : g
-    end
-
-    perm    = sortperm(sort_key; rev=true)
-    S2_gap  = S2_gap[perm]
-    S2U_gap = S2U_gap[perm]
-    S3_gap  = S3_gap[perm]
-    times   = times[perm]
-    modes   = modes[perm]
-
+    perm = sortperm([isnan(g) ? -Inf : g for g in BU_gap]; rev=true)
+    B_gap, BU_gap, Bo_gap, times, modes = B_gap[perm], BU_gap[perm], Bo_gap[perm], times[perm], modes[perm]
     x = collect(1:k)
 
     n   = sub.n[1]
@@ -611,7 +675,7 @@ function plot_instance_comp(df::DataFrame, inst_id::Int; outdir::AbstractString 
     label = hasproperty(sub, :inst_label) ? sub.inst_label[1] : "inst_$(inst_id)"
 
     p = plot(
-        x, S2U_gap;
+        x, BU_gap;
         xlabel    = "Relaxation mode",
         ylabel    = "Gap (%)",
         xticks    = (x, modes),
@@ -619,13 +683,12 @@ function plot_instance_comp(df::DataFrame, inst_id::Int; outdir::AbstractString 
         legend    = :topleft,
         marker    = :circle,
         linestyle = :solid,
-        label     = "S2U gap",
+        label     = "CompBinBou gap",
         size      = (1200, 600),
         margin    = 20mm,
     )
-
-    plot!(p, x, S2_gap; marker=:diamond, linestyle=:solid, label="S2 gap")
-    plot!(p, x, S3_gap; marker=:utriangle, linestyle=:solid, label="S3 gap")
+    plot!(p, x, B_gap;  marker=:diamond,   linestyle=:solid, label="CompBin gap")
+    plot!(p, x, Bo_gap; marker=:utriangle, linestyle=:solid, label="CompBou gap")
 
     finite_times = filter(!isnan, times)
     tmax = isempty(finite_times) ? 1.0 : maximum(finite_times)
@@ -641,7 +704,6 @@ function plot_instance_comp(df::DataFrame, inst_id::Int; outdir::AbstractString 
     )
 
     title!(p, "instance $label (n=$n, ρ=$rho)")
-
     outpath = joinpath(outdir, "inst_$(label).png")
     savefig(p, outpath)
     display(p)
@@ -650,8 +712,7 @@ end
 
 function plot_all_instances_comp(path::AbstractString; outdir::AbstractString = "plots_comp")
     df = load_results(path)
-    ids = sort(unique(df.inst_id))
-    for id in ids
+    for id in sort(unique(df.inst_id))
         @info "Plotting comp inst_id $id"
         plot_instance_comp(df, id; outdir=outdir)
     end
@@ -661,6 +722,9 @@ end
 end # module PlotGradualSDP
 
 
+# ============================================================
+# Interactive runner
+# ============================================================
 if isinteractive()
     using .RLTBigM
     using .RLT_SDP_Batch

@@ -44,8 +44,12 @@ function prepare_instance_comp(data::Dict{String,Any})
     H   = get(data, "H", nothing)
     h   = get(data, "h", nothing)
 
-    mminus = Vector{Float64}(data["Mminus"])
-    mplus  = Vector{Float64}(data["Mplus"])
+    # Accept Mminus/Mplus either as length-n vectors or diagonal matrices, and convert them to vectors.
+    mminus_raw = data["Mminus"]
+    mplus_raw  = data["Mplus"]
+
+    mminus = ndims(mminus_raw) == 1 ? Float64.(mminus_raw) : Float64.(diag(mminus_raw))
+    mplus  = ndims(mplus_raw)  == 1 ? Float64.(mplus_raw)  : Float64.(diag(mplus_raw))
     bigM_scale = Float64(get(data, "bigM_scale", 1.0))
 
     # General bounds: xL <= x <= xU
@@ -180,7 +184,7 @@ function add_FU_v!(m, x, v, X, V, W, params)
     # (x - xL)v^T >= 0  ->  W - xL v^T >= 0
     @constraint(m, W .- xL*v' .>= 0)
 
-    # (x - xL)(e - v)^T >= 0  ->  x e^T - W - xL e^T + xL v^T >= 0   (SIGNED CORRECTLY)
+    # (x - xL)(e - v)^T >= 0  ->  x e^T - W - xL e^T + xL v^T >= 0   
     @constraint(m, x*e' .- W .- xL*e' .+ xL*v' .>= 0)
 
     # (xU - x)v^T >= 0  ->  xU v^T - W >= 0
