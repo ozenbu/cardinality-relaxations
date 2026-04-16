@@ -146,7 +146,10 @@ if isinteractive()
     using .EUIUdiffinstance
     diff_inst = euiu_diff_instance()
 
+    include(normpath(joinpath(@__DIR__, "..", "instances", "SDP_separation_instance.jl")))
+    using .SDPCompBinSeparationInstance
+    sdp_sep_ins = sdp_compbin_vs_bigm_instance()
     # Run SDP BigM on both stored instances
-    SDPBigM.demo_SDP(alp_inst;  show_mats=true, show_Z=false)
+    SDPBigM.demo_SDP(diff_inst;  show_mats=true, show_Z=false)
     #SDPBigM.demo_SDP(diff_inst; show_mats=true, show_Z=false)
 end

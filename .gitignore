@@ -3,7 +3,6 @@
 *.png
 *.pdf
 *.lp
-REF/*
 *.txt
 *.py
 *.csv

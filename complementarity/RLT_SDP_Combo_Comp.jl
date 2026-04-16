@@ -8,11 +8,10 @@ using MathOptInterface
 const MOI = MathOptInterface
 
 # ------------------------------------------------------------------
-# Single source of truth:
-# - instance preparation for complementarity (general bounds xL<=x<=xU)
-# - RLT blocks (FC/FE/FB/FU) already updated
+# instance preparation + blocks (already updated to general bounds)
 # ------------------------------------------------------------------
-using ..RLTComp: prepare_instance_comp, add_FC_comp!, add_FE_v!, add_FB_v!, add_FU_v!
+using ..RLTBigM: prepare_instance
+using ..RLTComp: add_FC_comp!, add_FE_v!, add_FB_v!, add_FU_v!, additional_params
 
 # --------------------------------------------------------------
 # Relaxation modes (same structure as BigM combo)
@@ -53,7 +52,7 @@ all_pairs(n::Int) = [(i,j) for i in 1:n for j in i+1:n]
 # Generic strengthening blocks (re-used for X and/or V)
 # ==============================================================
 
-# 1) diag 2x2 SOC: Zii ≥ zi^2   via RSOC [Zii, 0.5, zi]
+# 1) diag 2x2 SOC: Zii ≥ zi^2 via RSOC [Zii, 0.5, zi]
 function add_SOC2x2_diag!(m::Model, z, Z)
     n = length(z)
     for i in 1:n
@@ -62,7 +61,7 @@ function add_SOC2x2_diag!(m::Model, z, Z)
     return nothing
 end
 
-# 2) full 2x2 minors: Zii*Zjj ≥ Zij^2 via RSOC [Zii, Zjj, sqrt(2)*Zij]
+# 2) full 2x2 minors: Zii*Zjj ≥ Zij^2 via RSOC [Zii, Zjj, √2*Zij]
 function add_SOC2x2_full!(m::Model, z, Z)
     n = length(z)
     add_SOC2x2_diag!(m, z, Z)
@@ -128,12 +127,12 @@ end
 """
     build_RLT_SDP_comp_model(data; variant="RLT_CompBinBou", relaxation=:RLT, optimizer)
 
-Variants (preferred naming):
+Variants:
 - "RLT_CompBin"      : FC_comp + FE_v + FB_v
 - "RLT_CompBinBou"   : FC_comp + FE_v + FB_v + FU_v
 - "RLT_CompBou"      : FC_comp + FE_v + FU_v
 
-Backward-compatible aliases:
+Aliases:
 - "RLT_S2"  -> "RLT_CompBin"
 - "RLT_S2U" -> "RLT_CompBinBou"
 - "RLT_S3"  -> "RLT_CompBou"
@@ -142,7 +141,6 @@ function build_RLT_SDP_comp_model(
     data::Dict{String,Any};
     variant::String="RLT_CompBinBou",
     optimizer = MosekTools.Optimizer,
-    build_only::Bool=false,
     relaxation::Symbol = :RLT,
     verbose::Bool=false
 )
@@ -153,11 +151,14 @@ function build_RLT_SDP_comp_model(
     if variant == "RLT_S2U"; variant = "RLT_CompBinBou"; end
     if variant == "RLT_S3";  variant = "RLT_CompBou"; end
 
-    params = prepare_instance_comp(data)  # includes eeT, xL, xU, etc.
+    # IMPORTANT: enrich params once (adds xL, xU, eeT)
+    params = additional_params(prepare_instance(data))
     @unpack n, ρ, Q0, q0 = params
 
     m = Model(optimizer)
-    verbose ? nothing : set_silent(m)
+    if !verbose
+        set_silent(m)
+    end
 
     # Decision variables (names match PrettyPrint auto-detection)
     @variable(m, x[1:n])
@@ -241,7 +242,7 @@ function build_RLT_SDP_comp_model(
 end
 
 # ==============================================================
-# PrettyPrint wrapper (model-based)
+# PrettyPrint wrapper
 # ==============================================================
 
 function solve_and_print(
@@ -257,14 +258,9 @@ function solve_and_print(
         error("PrettyPrint is not loaded. Please include(\"instances/prettyprint.jl\") before calling RLT_SDP_Comp_Combo.solve_and_print.")
     end
 
-    m = build_RLT_SDP_comp_model(data;
-        variant=variant,
-        relaxation=relaxation,
-        optimizer=optimizer,
-        build_only=true,
-        verbose=verbose
+    m = build_RLT_SDP_comp_model(
+        data; variant=variant, relaxation=relaxation, optimizer=optimizer, verbose=verbose
     )
-
     optimize!(m)
 
     Main.PrettyPrint.print_model_solution(
@@ -278,9 +274,10 @@ function solve_and_print(
     return m
 end
 
-# --------------------------------------------------------------
+# ==============================================================
 # Solve wrapper (returns values + time)
-# --------------------------------------------------------------
+# ==============================================================
+
 function solve_RLT_SDP_comp(
     data::Dict{String,Any};
     variant::String="RLT_CompBinBou",
@@ -294,15 +291,12 @@ function solve_RLT_SDP_comp(
 
     t0 = time_ns()
     optimize!(m)
-    t = round((time_ns() - t0) / 1e9; digits=4)
+    t  = round((time_ns() - t0) / 1e9; digits=4)
 
     st = termination_status(m)
     if st in (MOI.OPTIMAL, MOI.LOCALLY_SOLVED, MOI.ALMOST_OPTIMAL)
-        x = value.(m[:x])
-        v = value.(m[:v])
-        X = value.(m[:X])
-        V = value.(m[:V])
-        W = value.(m[:W])
+        x = value.(m[:x]); v = value.(m[:v])
+        X = value.(m[:X]); V = value.(m[:V]); W = value.(m[:W])
         return (st, objective_value(m), x, v, X, V, W, t)
     else
         return (st, nothing, nothing, nothing, nothing, nothing, nothing, t)

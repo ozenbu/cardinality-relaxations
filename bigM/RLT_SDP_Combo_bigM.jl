@@ -32,6 +32,8 @@ const RelaxationModes = (
     :RLT_PSD3x3_X,
     :RLT_PSD3x3_U,
     :RLT_PSD3x3_XU,
+    :RLT_PSD3x3_R,
+    :RLT_PSD3x3_XUR,
 
     :RLT_blockSDP_X,
     :RLT_blockSDP_U,
@@ -218,6 +220,32 @@ add_PSD3x3_XU!(m, x, X, u, U) = begin
 end
 
 # ------------------------------------------------------------------
+# 4b) mixed 3×3 PSD principals involving R:
+#     [ 1    x_i    u_j
+#       x_i  X_ii   R_ij
+#       u_j  R_ij   U_jj ] ⪰ 0   for all i,j
+# ------------------------------------------------------------------
+function add_PSD3x3_R!(model::Model, x, X, u, R, U)
+    n = length(x)
+    for i in 1:n, j in 1:n
+        @constraint(model, Symmetric([
+            1.0     x[i]       u[j];
+            x[i]    X[i,i]     R[i,j];
+            u[j]    R[i,j]     U[j,j]
+        ]) in PSDCone())
+    end
+    return nothing
+end
+
+# optional combined family:
+add_PSD3x3_XUR!(m, x, X, u, R, U) = begin
+    add_PSD3x3_X!(m, x, X)
+    add_PSD3x3_U!(m, u, U)
+    add_PSD3x3_R!(m, x, X, u, R, U)
+    nothing
+end
+
+# ------------------------------------------------------------------
 # 5) block SDP constraints: [1  x'; x  X]  and  [1  u'; u  U]
 # ------------------------------------------------------------------
 function add_blockSDP_X!(model::Model, x, X)
@@ -329,6 +357,10 @@ function build_RLT_SDP_model(
         add_PSD3x3_U!(m, u, U)
     elseif relaxation == :RLT_PSD3x3_XU
         add_PSD3x3_XU!(m, x, X, u, U)
+    elseif relaxation == :RLT_PSD3x3_R
+        add_PSD3x3_R!(m, x, X, u, R, U)
+    elseif relaxation == :RLT_PSD3x3_XUR
+        add_PSD3x3_XUR!(m, x, X, u, R, U)
 
     # ---- block SDP ----
     elseif relaxation == :RLT_blockSDP_X

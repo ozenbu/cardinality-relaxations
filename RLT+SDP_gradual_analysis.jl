@@ -1,60 +1,76 @@
+###############################
+# RLT+SDP gradual analysis driver (BigM + Comp)
+# - read_instance! : JSON Dict -> Julia arrays + validates Big-M presence
+# - uses solve_RLT_SDP (BigM family) and build_RLT_SDP_comp_model (Comp family)
+# - writes CSV/JSON
+###############################
+
 module RLT_SDP_Batch
 
 using JSON, CSV
 using JuMP, MosekTools, LinearAlgebra
 using OrderedCollections: OrderedDict
-using MathOptInterface
-const MOI = MathOptInterface
+import MathOptInterface as MOI
 
+# BigM / Comp solvers (defined elsewhere)
 using Main.RLT_SDP_Combo: solve_RLT_SDP, RelaxationModes
 using Main.RLT_SDP_Comp_Combo: build_RLT_SDP_comp_model, RelaxationModes as RelaxationModesComp
 
+# Single source of truth for instance validity (Big-M handling etc.)
+using Main.RLTBigM: prepare_instance
+
 # ------------------------
-# Basic coercions
+# basic coercions
 # ------------------------
 _as_float(x) = x isa Number ? Float64(x) : throw(ArgumentError("Expected number, got $(typeof(x))"))
 _as_vec(x)   = x === nothing ? nothing : Float64.(collect(x))
 
-function gap_pct(obj_relax, exact_obj; digits::Int = 4)
-    if ismissing(exact_obj) || obj_relax === nothing || ismissing(obj_relax)
-        return missing
-    end
-    raw = 100.0 * abs(Float64(obj_relax) - Float64(exact_obj)) / max(1.0, abs(Float64(exact_obj)))
-    return round(raw; digits = digits)
-end
-
-function _as_mat_with_n(x, n::Int)
+# JSON matrix -> Float64 matrix (no shape assumption)
+function _as_mat(x)
     x === nothing && return nothing
     if x isa AbstractMatrix
-        M = Float64.(x)
-        return size(M,2) == n ? M : (size(M,1) == n ? M' : error("bad shape $(size(M)) for n=$n"))
+        return Float64.(x)
     elseif x isa AbstractVector
-        # JSON often gives matrices as Vector{Vector}
         @assert !isempty(x) && x[1] isa AbstractVector
         rows = [permutedims(Float64.(v)) for v in x]
-        Mrow = reduce(vcat, rows)
-        return size(Mrow, 2) == n ? Mrow :
-               size(Mrow, 1) == n ? Mrow' : error("cannot coerce matrix with n=$n")
+        return reduce(vcat, rows)
     else
-        error("unsupported type $(typeof(x))")
+        error("Unsupported matrix type: $(typeof(x))")
+    end
+end
+
+# n×n required (Q0/Qi/Pi)
+function _as_mat_square(x, n::Int; name::String="Q0")
+    M = _as_mat(x)
+    (size(M,1) == n && size(M,2) == n) || error("$name must be n×n with n=$n, got size=$(size(M))")
+    return M
+end
+
+# m×n required (A/H). If given as n×m, transpose.
+function _as_mat_cols_n(x, n::Int; name::String="A")
+    M = _as_mat(x)
+    if size(M,2) == n
+        return M
+    elseif size(M,1) == n
+        return M'  # transpose into (m×n)
+    else
+        error("$name must have n=$n columns (or be transposed with n rows). Got size=$(size(M)).")
     end
 end
 
 _as_tuple_vec(x) = x === nothing ? nothing :
     (x isa Tuple ? x : Tuple(x)) .|> v -> Float64.(collect(v))
 
-function _as_tuple_mat(x, n::Int)
+function _as_tuple_mat_square(x, n::Int; name::String="Qi")
     x === nothing && return nothing
     xs = x isa Tuple ? x : Tuple(x)
-    return Tuple(_as_mat_with_n(M, n) for M in xs)
+    return Tuple(_as_mat_square(M, n; name=name) for M in xs)
 end
 
 _as_tuple_num(x) = x === nothing ? nothing :
     (x isa Tuple ? x : Tuple(x)) .|> _as_float
 
-# ------------------------
-# Big-M helpers: accept vector or diagonal matrix; return diagonal vector
-# ------------------------
+# Big-M: accept vector OR diagonal matrix; return diagonal vector
 function _as_diagvec(x, n::Int; name::String="M")
     x === nothing && return nothing
 
@@ -68,13 +84,11 @@ function _as_diagvec(x, n::Int; name::String="M")
         length(v) == n || error("$name size mismatch, need n=$n")
         return v
 
-    elseif x isa AbstractMatrix
-        M = Float64.(x)
-        size(M,1) == n && size(M,2) == n || error("$name must be n×n, got $(size(M))")
-
-        # Require diagonal (avoid silently ignoring off-diagonals)
+    elseif x isa AbstractMatrix || x isa AbstractVector
+        M = _as_mat(x)
+        (size(M,1) == n && size(M,2) == n) || error("$name must be n×n (diagonal), got $(size(M))")
         off = M .- Diagonal(diag(M))
-        maximum(abs.(off)) ≤ 1e-12 || error("$name must be diagonal.")
+        maximum(abs.(off)) <= 1e-12 || error("$name must be diagonal (nonzero off-diagonals found).")
         return Float64.(diag(M))
 
     else
@@ -82,7 +96,7 @@ function _as_diagvec(x, n::Int; name::String="M")
     end
 end
 
-# Pull the first existing key among candidates
+# pull first existing key among candidates
 function _get_any(d::Dict{String,Any}, keys::Tuple{Vararg{String}})
     for k in keys
         if haskey(d, k) && d[k] !== nothing
@@ -93,51 +107,78 @@ function _get_any(d::Dict{String,Any}, keys::Tuple{Vararg{String}})
 end
 
 # ------------------------
-# Normalizer: makes instances compatible with BOTH BigM + Comp pipelines
-# - Supports either (M_minus,M_plus) OR single M
-# - Accepts vector or diagonal matrix
-# - Writes BOTH naming styles:
-#     underscore: M_minus, M_plus
-#     camel:      Mminus, Mplus
-# - Also keeps/creates M (legacy symmetric)
+# gap helper
 # ------------------------
-function normalize_instance!(d::Dict{String,Any})
-    @assert haskey(d,"n")
+function gap_pct(obj_relax, exact_obj; digits::Int = 4)
+    if ismissing(exact_obj) || obj_relax === nothing || ismissing(obj_relax)
+        return missing
+    end
+    raw = 100.0 * abs(Float64(obj_relax) - Float64(exact_obj)) / max(1.0, abs(Float64(exact_obj)))
+    return round(raw; digits = digits)
+end
+
+_is_good_status(st::MOI.TerminationStatusCode) =
+    st in (MOI.OPTIMAL, MOI.ALMOST_OPTIMAL, MOI.LOCALLY_SOLVED)
+
+# ============================================================
+# read_instance!  (JSON Dict -> Julia arrays + validates Big-M)
+# ============================================================
+function read_instance!(d::Dict{String,Any})
+    @assert haskey(d, "n") "Missing key `n`."
     d["n"] = Int(d["n"])
     n = d["n"]
 
-    # rho as Int (cardinality)
+    inst_label = get(d, "id", "(no id)")
+
     if haskey(d, "rho") && d["rho"] !== nothing
         d["rho"] = Int(round(_as_float(d["rho"])))
+    else
+        error("Instance $inst_label: missing key `rho`.")
     end
 
-    # bigM_scale default
-    d["bigM_scale"] = Float64(get(d, "bigM_scale", 1.0))
-
-    # Matrices (n×n)
-    for k in ("Q0","A","H")
-        if haskey(d,k) && d[k] !== nothing
-            d[k] = _as_mat_with_n(d[k], n)
-        end
+    # n×n matrices
+    if haskey(d, "Q0") && d["Q0"] !== nothing
+        d["Q0"] = _as_mat_square(d["Q0"], n; name="Q0")
     end
 
-    # Vectors
-    for k in ("q0","b","h")
-        if haskey(d,k) && d[k] !== nothing
+    # A/H are (m×n) (transpose allowed)
+    if haskey(d, "A") && d["A"] !== nothing
+        d["A"] = _as_mat_cols_n(d["A"], n; name="A")
+        (haskey(d, "b") && d["b"] !== nothing) || error("Instance $inst_label: A provided but b missing.")
+    end
+    if haskey(d, "H") && d["H"] !== nothing
+        d["H"] = _as_mat_cols_n(d["H"], n; name="H")
+        (haskey(d, "h") && d["h"] !== nothing) || error("Instance $inst_label: H provided but h missing.")
+    end
+
+    # vectors
+    for k in ("q0", "b", "h")
+        if haskey(d, k) && d[k] !== nothing
             d[k] = _as_vec(d[k])
         end
     end
 
-    # Quadratic constraints bundles (may be nothing)
-    d["Qi"] = _as_tuple_mat(get(d,"Qi", nothing), n)
-    d["Pi"] = _as_tuple_mat(get(d,"Pi", nothing), n)
-    d["qi"] = _as_tuple_vec(get(d,"qi", nothing))
-    d["pi"] = _as_tuple_vec(get(d,"pi", nothing))
-    d["ri"] = _as_tuple_num(get(d,"ri", nothing))
-    d["si"] = _as_tuple_num(get(d,"si", nothing))
+    # dimension checks for (A,b) and (H,h)
+    if haskey(d, "A") && d["A"] !== nothing && haskey(d, "b") && d["b"] !== nothing
+        length(d["b"]) == size(d["A"], 1) || error("Instance $inst_label: length(b)=$(length(d["b"])) must match size(A,1)=$(size(d["A"],1)).")
+    end
+    if haskey(d, "H") && d["H"] !== nothing && haskey(d, "h") && d["h"] !== nothing
+        length(d["h"]) == size(d["H"], 1) || error("Instance $inst_label: length(h)=$(length(d["h"])) must match size(H,1)=$(size(d["H"],1)).")
+    end
+
+    # quadratic bundles (may be nothing)
+    d["Qi"] = _as_tuple_mat_square(get(d, "Qi", nothing), n; name="Qi")
+    d["Pi"] = _as_tuple_mat_square(get(d, "Pi", nothing), n; name="Pi")
+    d["qi"] = _as_tuple_vec(get(d, "qi", nothing))
+    d["pi"] = _as_tuple_vec(get(d, "pi", nothing))
+    d["ri"] = _as_tuple_num(get(d, "ri", nothing))
+    d["si"] = _as_tuple_num(get(d, "si", nothing))
 
     # ------------------------
-    # Unified Big-M handling (NO DEFAULTS)
+    # Big-M: NO DEFAULTS
+    # Accept:
+    #   - pair: (M_minus,M_plus) or (Mminus,Mplus)
+    #   - single: M
     # ------------------------
     mminus_raw = _get_any(d, ("M_minus", "Mminus"))
     mplus_raw  = _get_any(d, ("M_plus",  "Mplus"))
@@ -148,39 +189,40 @@ function normalize_instance!(d::Dict{String,Any})
 
     if has_pair
         (mminus_raw !== nothing && mplus_raw !== nothing) ||
-            error("Instance $(get(d, "id", "(no id)")): provide both M_minus and M_plus (or Mminus and Mplus), or provide only M.")
-            
-        mminus = _as_diagvec(mminus_raw, n; name="M_minus")
-        mplus  = _as_diagvec(mplus_raw,  n; name="M_plus")
+            error("Instance $inst_label: provide BOTH Mminus & Mplus (or M_minus & M_plus), or provide only M.")
 
-        # canonical storage (both styles)
-        d["M_minus"] = mminus
-        d["M_plus"]  = mplus
+        mminus = _as_diagvec(mminus_raw, n; name="Mminus")
+        mplus  = _as_diagvec(mplus_raw,  n; name="Mplus")
+
         d["Mminus"]  = mminus
         d["Mplus"]   = mplus
+        d["M_minus"] = mminus
+        d["M_plus"]  = mplus
 
-        # optional legacy symmetric M (for older code paths)
+        # optional symmetric M (legacy)
         d["M"] = max.(mminus, mplus)
 
     elseif has_single
         m = _as_diagvec(m_raw, n; name="M")
-
-        d["M"]       = m
+        d["M"]      = m
+        d["Mminus"] = copy(m)
+        d["Mplus"]  = copy(m)
         d["M_minus"] = copy(m)
         d["M_plus"]  = copy(m)
-        d["Mminus"]  = copy(m)
-        d["Mplus"]   = copy(m)
 
     else
-        error("Instance $inst_id: missing Big-M data. Provide either (M_minus & M_plus) or a single M.")
+        error("Instance $inst_label: missing Big-M data. Provide either (Mminus & Mplus) or a single M.")
     end
+
+    # final validity check via single source of truth
+    prepare_instance(d)  # throws if inconsistent
 
     return d
 end
 
-# ------------------------
+# ============================================================
 # Exact callback wrapper
-# ------------------------
+# ============================================================
 function _get_exact(data::Dict{String,Any}; exact_cb=nothing)
     if exact_cb === nothing
         return ("MISSING", missing, nothing, missing)
@@ -199,12 +241,9 @@ function _get_exact(data::Dict{String,Any}; exact_cb=nothing)
     end
 end
 
-_is_good_status(st::MOI.TerminationStatusCode) =
-    st in (MOI.OPTIMAL, MOI.ALMOST_OPTIMAL, MOI.LOCALLY_SOLVED)
-
-# ------------------------
+# ============================================================
 # Solve Comp model (one mode)
-# ------------------------
+# ============================================================
 function _solve_comp(data::Dict{String,Any};
                      variant::String,
                      optimizer = MosekTools.Optimizer,
@@ -225,14 +264,15 @@ function _solve_comp(data::Dict{String,Any};
     return st, obj, t
 end
 
-# ------------------------
-# Analyze one instance: BigM family (EU/IU)
-# ------------------------
+# ============================================================
+# Analyze one instance: BigM family (EU / IU)
+# ============================================================
 function analyze_instance(data::Dict{String,Any};
                           modes = RelaxationModes,
                           optimizer = MosekTools.Optimizer,
                           exact_cb = nothing,
                           inst_label::AbstractString = "")
+
     exact_status, exact_obj, exact_x, exact_time = _get_exact(data; exact_cb=exact_cb)
 
     rows = NamedTuple[]
@@ -240,12 +280,8 @@ function analyze_instance(data::Dict{String,Any};
         println(inst_label == "" ? ">>> solving relaxation = $(md)"
                                  : ">>> [$(inst_label)] solving relaxation = $(md)")
 
-        stE, objE, _, _, _, _, _, tE = solve_RLT_SDP(
-            data; variant="EU", optimizer=optimizer, relaxation=md,
-        )
-        stI, objI, _, _, _, _, _, tI = solve_RLT_SDP(
-            data; variant="IU", optimizer=optimizer, relaxation=md,
-        )
+        stE, objE, _, _, _, _, _, tE = solve_RLT_SDP(data; variant="EU", optimizer=optimizer, relaxation=md)
+        stI, objI, _, _, _, _, _, tI = solve_RLT_SDP(data; variant="IU", optimizer=optimizer, relaxation=md)
 
         push!(rows, (
             mode        = String(md),
@@ -269,9 +305,10 @@ function analyze_instance(data::Dict{String,Any};
     return rows, exact_block
 end
 
-# ------------------------
-# Analyze one instance: Complementarity family (CompBin / CompBinBou / CompBou)
-# ------------------------
+# ============================================================
+# Analyze one instance: Complementarity family
+# (CompBin / CompBinBou / CompBou)
+# ============================================================
 function analyze_instance_comp(data::Dict{String,Any};
                                modes = RelaxationModesComp,
                                optimizer = MosekTools.Optimizer,
@@ -285,27 +322,27 @@ function analyze_instance_comp(data::Dict{String,Any};
         println(inst_label == "" ? ">>> solving relaxation = $(md)"
                                  : ">>> [$(inst_label)] solving relaxation = $(md)")
 
-        stB,  objB,  tB  = _solve_comp(data; variant="RLT_CompBin",     optimizer=optimizer, relaxation=md)
-        stBU, objBU, tBU = _solve_comp(data; variant="RLT_CompBinBou",  optimizer=optimizer, relaxation=md)
-        stBo, objBo, tBo = _solve_comp(data; variant="RLT_CompBou",     optimizer=optimizer, relaxation=md)
+        stB,  objB,  tB  = _solve_comp(data; variant="RLT_CompBin",    optimizer=optimizer, relaxation=md)
+        stBU, objBU, tBU = _solve_comp(data; variant="RLT_CompBinBou", optimizer=optimizer, relaxation=md)
+        stBo, objBo, tBo = _solve_comp(data; variant="RLT_CompBou",    optimizer=optimizer, relaxation=md)
 
         push!(rows, (
-            mode               = String(md),
+            mode                 = String(md),
 
-            CompBin_status     = string(stB),
-            CompBin_obj        = (objB === nothing ? missing : objB),
-            CompBin_gap        = gap_pct(objB, exact_obj),
-            CompBin_time_sec   = tB,
+            CompBin_status       = string(stB),
+            CompBin_obj          = (objB === nothing ? missing : objB),
+            CompBin_gap          = gap_pct(objB, exact_obj),
+            CompBin_time_sec     = tB,
 
-            CompBinBou_status  = string(stBU),
-            CompBinBou_obj     = (objBU === nothing ? missing : objBU),
-            CompBinBou_gap     = gap_pct(objBU, exact_obj),
-            CompBinBou_time_sec= tBU,
+            CompBinBou_status    = string(stBU),
+            CompBinBou_obj       = (objBU === nothing ? missing : objBU),
+            CompBinBou_gap       = gap_pct(objBU, exact_obj),
+            CompBinBou_time_sec  = tBU,
 
-            CompBou_status     = string(stBo),
-            CompBou_obj        = (objBo === nothing ? missing : objBo),
-            CompBou_gap        = gap_pct(objBo, exact_obj),
-            CompBou_time_sec   = tBo,
+            CompBou_status       = string(stBo),
+            CompBou_obj          = (objBo === nothing ? missing : objBo),
+            CompBou_gap          = gap_pct(objBo, exact_obj),
+            CompBou_time_sec     = tBo,
         ))
     end
 
@@ -318,18 +355,18 @@ function analyze_instance_comp(data::Dict{String,Any};
     return rows, exact_block
 end
 
-# ------------------------
+# ============================================================
 # Batch: BigM family
-# ------------------------
+# ============================================================
 function run_batch(instances_json::AbstractString;
-                   out_csv::AbstractString="batch_results.csv",
-                   out_json::AbstractString="batch_results.json",
+                   out_csv::AbstractString="gradual_sdp_results.csv",
+                   out_json::AbstractString="gradual_sdp_results.json",
                    modes = RelaxationModes,
                    optimizer = MosekTools.Optimizer,
                    exact_cb = nothing)
 
     raw = JSON.parsefile(instances_json)
-    insts = [normalize_instance!(deepcopy(d)) for d in raw]
+    insts = [read_instance!(deepcopy(d)) for d in raw]
 
     all_rows = NamedTuple[]
     json_out = OrderedDict[]
@@ -341,9 +378,7 @@ function run_batch(instances_json::AbstractString;
         println("instance $k : $inst_label")
         println("==============================")
 
-        rows, exact_block = analyze_instance(
-            data; modes=modes, optimizer=optimizer, exact_cb=exact_cb, inst_label=inst_label,
-        )
+        rows, exact_block = analyze_instance(data; modes=modes, optimizer=optimizer, exact_cb=exact_cb, inst_label=inst_label)
 
         for r in rows
             push!(all_rows, (
@@ -401,18 +436,18 @@ function run_batch(instances_json::AbstractString;
     return (csv = out_csv, json = out_json, count = length(insts))
 end
 
-# ------------------------
+# ============================================================
 # Batch: Complementarity family
-# ------------------------
+# ============================================================
 function run_batch_comp(instances_json::AbstractString;
-                        out_csv::AbstractString="batch_comp_results.csv",
-                        out_json::AbstractString="batch_comp_results.json",
+                        out_csv::AbstractString="gradual_comp_results.csv",
+                        out_json::AbstractString="gradual_comp_results.json",
                         modes = RelaxationModesComp,
                         optimizer = MosekTools.Optimizer,
                         exact_cb = nothing)
 
     raw = JSON.parsefile(instances_json)
-    insts = [normalize_instance!(deepcopy(d)) for d in raw]
+    insts = [read_instance!(deepcopy(d)) for d in raw]
 
     all_rows = NamedTuple[]
     json_out = OrderedDict[]
@@ -424,37 +459,35 @@ function run_batch_comp(instances_json::AbstractString;
         println("instance $k : $inst_label")
         println("==============================")
 
-        rows, exact_block = analyze_instance_comp(
-            data; modes=modes, optimizer=optimizer, exact_cb=exact_cb, inst_label=inst_label,
-        )
+        rows, exact_block = analyze_instance_comp(data; modes=modes, optimizer=optimizer, exact_cb=exact_cb, inst_label=inst_label)
 
         for r in rows
             push!(all_rows, (
-                inst_id            = k,
-                inst_label         = inst_label,
-                n                  = get(data,"n",missing),
-                rho                = get(data,"rho",missing),
+                inst_id              = k,
+                inst_label           = inst_label,
+                n                    = get(data,"n",missing),
+                rho                  = get(data,"rho",missing),
 
-                mode               = r.mode,
+                mode                 = r.mode,
 
-                CompBin_status     = r.CompBin_status,
-                CompBin_obj        = r.CompBin_obj,
-                CompBin_gap        = r.CompBin_gap,
-                CompBin_time_sec   = r.CompBin_time_sec,
+                CompBin_status       = r.CompBin_status,
+                CompBin_obj          = r.CompBin_obj,
+                CompBin_gap          = r.CompBin_gap,
+                CompBin_time_sec     = r.CompBin_time_sec,
 
-                CompBinBou_status  = r.CompBinBou_status,
-                CompBinBou_obj     = r.CompBinBou_obj,
-                CompBinBou_gap     = r.CompBinBou_gap,
-                CompBinBou_time_sec= r.CompBinBou_time_sec,
+                CompBinBou_status    = r.CompBinBou_status,
+                CompBinBou_obj       = r.CompBinBou_obj,
+                CompBinBou_gap       = r.CompBinBou_gap,
+                CompBinBou_time_sec  = r.CompBinBou_time_sec,
 
-                CompBou_status     = r.CompBou_status,
-                CompBou_obj        = r.CompBou_obj,
-                CompBou_gap        = r.CompBou_gap,
-                CompBou_time_sec   = r.CompBou_time_sec,
+                CompBou_status       = r.CompBou_status,
+                CompBou_obj          = r.CompBou_obj,
+                CompBou_gap          = r.CompBou_gap,
+                CompBou_time_sec     = r.CompBou_time_sec,
 
-                exact_status       = exact_block["exact_status"],
-                exact_obj          = exact_block["exact_obj"],
-                exact_time_sec     = exact_block["exact_time_sec"]
+                exact_status         = exact_block["exact_status"],
+                exact_obj            = exact_block["exact_obj"],
+                exact_time_sec       = exact_block["exact_time_sec"]
             ))
         end
 
@@ -496,13 +529,13 @@ function run_batch_comp(instances_json::AbstractString;
     return (csv = out_csv, json = out_json, count = length(insts))
 end
 
-export normalize_instance!, run_batch, run_batch_comp, gap_pct
+export read_instance!, run_batch, run_batch_comp, gap_pct
 
 end # module RLT_SDP_Batch
 
 
 # ============================================================
-# Plotting utilities (updated to CompBin naming)
+# Plotting utilities (time series in pink)
 # ============================================================
 module PlotGradualSDP
 
@@ -519,6 +552,7 @@ const RelaxationOrder = [
     "RLT_SOC_directional_X", "RLT_SOC_directional_U", "RLT_SOC_directional_XU",
     "RLT_SOC_hybrid_X", "RLT_SOC_hybrid_U", "RLT_SOC_hybrid_XU",
     "RLT_PSD3x3_X", "RLT_PSD3x3_U", "RLT_PSD3x3_XU",
+    "RLT_PSD3x3_R", "RLT_PSD3x3_XUR",
     "RLT_blockSDP_X", "RLT_blockSDP_U", "RLT_blockSDP_XU",
     "RLT_full_SDP",
 ]
@@ -548,8 +582,7 @@ function plot_instance(df::DataFrame, inst_id::Int; outdir::AbstractString = "pl
     nrow(sub) == 0 && (@warn "No rows for inst_id = $inst_id"; return nothing)
 
     sub[!, :mode_str] = String.(sub.mode)
-    RelaxationSet = Set(RelaxationOrder)
-    sub = sub[[m in RelaxationSet for m in sub.mode_str], :]
+    sub = sub[[m in Set(RelaxationOrder) for m in sub.mode_str], :]
     nrow(sub) == 0 && (@warn "No known modes for inst_id = $inst_id"; return nothing)
 
     k     = nrow(sub)
@@ -611,7 +644,7 @@ function plot_instance(df::DataFrame, inst_id::Int; outdir::AbstractString = "pl
         color     = :deeppink,
     )
 
-    title!(p, "instance $label (n=$n, ρ=$rho)")
+    title!(p, "instance $label (n=$n, rho=$rho)")
     outpath = joinpath(outdir, "inst_$(label).png")
     savefig(p, outpath)
     display(p)
@@ -634,8 +667,7 @@ function plot_instance_comp(df::DataFrame, inst_id::Int; outdir::AbstractString 
     nrow(sub) == 0 && (@warn "No rows for inst_id = $inst_id"; return nothing)
 
     sub[!, :mode_str] = String.(sub.mode)
-    RelaxationSet = Set(RelaxationOrderComp)
-    sub = sub[[m in RelaxationSet for m in sub.mode_str], :]
+    sub = sub[[m in Set(RelaxationOrderComp) for m in sub.mode_str], :]
     nrow(sub) == 0 && (@warn "No known modes for inst_id = $inst_id"; return nothing)
 
     k     = nrow(sub)
@@ -701,9 +733,10 @@ function plot_instance_comp(df::DataFrame, inst_id::Int; outdir::AbstractString 
         label     = "time",
         legend    = :topright,
         ylims     = (0, ymax),
+        color     = :deeppink,
     )
 
-    title!(p, "instance $label (n=$n, ρ=$rho)")
+    title!(p, "instance $label (n=$n, rho=$rho)")
     outpath = joinpath(outdir, "inst_$(label).png")
     savefig(p, outpath)
     display(p)
@@ -721,7 +754,6 @@ end
 
 end # module PlotGradualSDP
 
-
 # ============================================================
 # Interactive runner
 # ============================================================
@@ -731,7 +763,7 @@ if isinteractive()
     using .PlotGradualSDP
     using MosekTools
     using Gurobi
-
+    """
     batch = RLT_SDP_Batch.run_batch(
         "instances.json";
         out_csv   = "gradual_sdp_results.csv",
@@ -740,7 +772,8 @@ if isinteractive()
         exact_cb  = data -> RLTBigM.build_and_solve(data; variant="EXACT", optimizer=Gurobi.Optimizer),
     )
     println(batch)
-
+    """
+    """
     batch_comp = RLT_SDP_Batch.run_batch_comp(
         "instances.json";
         out_csv   = "gradual_comp_results.csv",
@@ -749,7 +782,7 @@ if isinteractive()
         exact_cb  = data -> RLTBigM.build_and_solve(data; variant="EXACT", optimizer=Gurobi.Optimizer),
     )
     println(batch_comp)
-
+    """
     PlotGradualSDP.plot_all_instances("gradual_sdp_results.csv"; outdir="plots")
     PlotGradualSDP.plot_all_instances_comp("gradual_comp_results.csv"; outdir="plots_comp")
 end
