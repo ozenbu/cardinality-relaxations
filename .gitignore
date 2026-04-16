@@ -6,3 +6,6 @@
 *.txt
 *.py
 *.csv
+
+!REF/*.pdf
+!REF/**/*.pdf
