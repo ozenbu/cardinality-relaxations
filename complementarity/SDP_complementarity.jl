@@ -212,12 +212,19 @@ if isinteractive()
     include(normpath(joinpath(@__DIR__, "..", "instances", "SDP_separation_instance.jl")))
     using .SDPCompBinSeparationInstance
     sdp_sep_ins = sdp_compbin_vs_bigm_instance()
+
+    include(normpath(joinpath(@__DIR__, "..", "instances", "bomze_counterexample.jl")))
+    using .CounterexampleInstances
+    bomze_counterex = bomze_counterexample()
+    
+
     # =========================================================
     # Choose which instance to run (edit only this line)
     # =========================================================
     inst = alp_inst
     inst = sdp_sep_ins
     #inst = diff_inst
+    inst = bomze_counterex
 
     variants = ("SDP_CompBin", "SDP_CompBou")   
 

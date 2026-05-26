@@ -24,41 +24,44 @@ ensure_tuple(x) =
     prepare_instance(data::Dict)
 
 Takes a raw QCQP instance dictionary `data` and returns all fields
-in a consistent, ready-to-use format:
+in a consistent, ready-to-use format.
 
-- Always returns tuples for possibly-missing entries (Qi, qi, ri, Pi, pi, si).
+- Always returns iterable containers for possibly-missing entries
+  (Qi, qi, ri, Pi, pi, si).
 - If A or H is missing, defaults to empty arrays.
 - Big-M is handled in a unified way:
     * If `Mminus` and `Mplus` are given, they are used.
+    * Else if `M_minus` and `M_plus` are given, they are used.
     * Otherwise a single `M` is used and we set Mminus = Mplus = M.
-  All Big-M matrices are converted to Diagonal matrices.
+  All Big-M vectors are converted to Diagonal matrices.
 - Provides the all-ones vector e.
 - Q0 and q0 default to zeros if not provided.
 """
 function prepare_instance(data::Dict)
     # Core scalars
-    n   = data["n"]
-    ρ   = data["rho"]
+    n = data["n"]
+    ρ = data["rho"]
 
-    # Objective (defaults if absent)
-    Q0  = get(data, "Q0", zeros(n,n)) :: AbstractMatrix
-    q0  = get(data, "q0", zeros(n))   :: AbstractVector
+    # Objective
+    Q0 = get(data, "Q0", zeros(n, n)) :: AbstractMatrix
+    q0 = get(data, "q0", zeros(n))    :: AbstractVector
 
     # Quadratic inequality constraints
-    Qi  = ensure_tuple(get(data, "Qi", ()))
-    qi  = ensure_tuple(get(data, "qi", ()))
-    ri  = ensure_tuple(get(data, "ri", ()))
+    Qi = ensure_tuple(get(data, "Qi", ()))
+    qi = ensure_tuple(get(data, "qi", ()))
+    ri = ensure_tuple(get(data, "ri", ()))
 
     # Quadratic equality constraints
-    Pi  = ensure_tuple(get(data, "Pi", ()))
-    pi  = ensure_tuple(get(data, "pi", ()))
-    si  = ensure_tuple(get(data, "si", ()))
+    Pi = ensure_tuple(get(data, "Pi", ()))
+    pi = ensure_tuple(get(data, "pi", ()))
+    si = ensure_tuple(get(data, "si", ()))
 
     # Linear inequalities
     A = get(data, "A", nothing)
     b = get(data, "b", nothing)
     if A === nothing
-        A = zeros(0, n); b = zeros(0)
+        A = zeros(0, n)
+        b = zeros(0)
     end
     ℓ = size(A, 1)
 
@@ -66,31 +69,44 @@ function prepare_instance(data::Dict)
     H = get(data, "H", nothing)
     h = get(data, "h", nothing)
     if H === nothing
-        H = zeros(0, n); h = zeros(0)
+        H = zeros(0, n)
+        h = zeros(0)
     end
     η = size(H, 1)
 
     # Big-M:
-    # - If user gives Mminus & Mplus, use them.
-    # - Else fall back to single M and set Mminus = Mplus = M.
-    if haskey(data, "Mminus") || haskey(data, "Mplus")
-        if !(haskey(data, "Mminus") && haskey(data, "Mplus"))
-            error("If you provide `Mminus` or `Mplus`, you must provide both.")
+    # - Accept both naming conventions:
+    #     Mminus / Mplus
+    #     M_minus / M_plus
+    # - If neither pair is given, fall back to common M.
+    has_Mminus = haskey(data, "Mminus") || haskey(data, "M_minus")
+    has_Mplus  = haskey(data, "Mplus")  || haskey(data, "M_plus")
+
+    if has_Mminus || has_Mplus
+        if !(has_Mminus && has_Mplus)
+            error("If you provide one of Mminus/Mplus or M_minus/M_plus, you must provide both minus and plus bounds.")
         end
-        Mminus_raw = data["Mminus"]
-        Mplus_raw  = data["Mplus"]
+
+        Mminus_raw = haskey(data, "Mminus") ? data["Mminus"] : data["M_minus"]
+        Mplus_raw  = haskey(data, "Mplus")  ? data["Mplus"]  : data["M_plus"]
 
         Mminus_diag = ndims(Mminus_raw) == 1 ? Mminus_raw : diag(Mminus_raw)
         Mplus_diag  = ndims(Mplus_raw)  == 1 ? Mplus_raw  : diag(Mplus_raw)
 
-        Mminus = Diagonal(Mminus_diag)
-        Mplus  = Diagonal(Mplus_diag)
+        Mminus = Diagonal(Float64.(Mminus_diag))
+        Mplus  = Diagonal(Float64.(Mplus_diag))
+
     else
         # Backward compatible: single symmetric M
+        if !haskey(data, "M")
+            error("No Big-M data found. Provide either M, or Mminus/Mplus, or M_minus/M_plus.")
+        end
+
         Mraw  = data["M"]
         Mdiag = ndims(Mraw) == 1 ? Mraw : diag(Mraw)
-        Mminus = Diagonal(Mdiag)
-        Mplus  = Diagonal(Mdiag)
+
+        Mminus = Diagonal(Float64.(Mdiag))
+        Mplus  = Diagonal(Float64.(Mdiag))
     end
 
     # Ones vector
@@ -99,7 +115,6 @@ function prepare_instance(data::Dict)
     return (; n, ρ, Q0, q0, Qi, qi, ri, Pi, pi, si,
             A, b, ℓ, H, h, η, Mminus, Mplus, e)
 end
-
 # ---------- constraint blocks ----------
 function add_FC!(m, x, u, X, R, U, params)
     @unpack n, Qi, qi, ri, Pi, pi, si,
@@ -425,5 +440,5 @@ if isinteractive()
     using .EUIUdiffinstance
     diff_inst = euiu_diff_instance()
 
-    RLTBigM.demo(alp_inst)
+    RLTBigM.demo(diff_inst)
 end

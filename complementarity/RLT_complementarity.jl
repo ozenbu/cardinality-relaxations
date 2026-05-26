@@ -367,8 +367,13 @@ using .PrettyPrint
 # --- Instance ---
 include(normpath(joinpath(@__DIR__, "..", "instances", "alper_stqp_instance.jl")))
 using .AlperStqpInstances
-inst = alper_stqp_rho3_instance()
+alp_inst = alper_stqp_rho3_instance()
 
+include(normpath(joinpath(@__DIR__, "..", "instances", "diff_RLTEU_RLTIU_bigM_instance.jl")))
+using .EUIUdiffinstance
+diff_inst = euiu_diff_instance()
+
+inst =  diff_inst
 variants = [
     "EXACT_CompBin",
     "EXACT_CompBou",
