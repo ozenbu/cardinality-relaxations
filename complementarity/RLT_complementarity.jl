@@ -320,7 +320,7 @@ if isinteractive()
     # Instance
     include(normpath(joinpath(@__DIR__, "..", "instances", "alper_stqp_instance.jl")))
     using .AlperStqpInstances
-    inst = alper_stqp_rho3_instance()
+    inst = AlperStqpInstances.alper_stqp_rho3_instance()
 
     variants = [
         "EXACT_CompBin",
@@ -357,53 +357,3 @@ if isinteractive()
     end
 end
 
-using Gurobi
-using JuMP
-
-# --- PrettyPrint (your existing helper) ---
-include(normpath(joinpath(@__DIR__, "..", "instances", "prettyprint.jl")))
-using .PrettyPrint
-
-# --- Instance ---
-include(normpath(joinpath(@__DIR__, "..", "instances", "alper_stqp_instance.jl")))
-using .AlperStqpInstances
-alp_inst = alper_stqp_rho3_instance()
-
-include(normpath(joinpath(@__DIR__, "..", "instances", "diff_RLTEU_RLTIU_bigM_instance.jl")))
-using .EUIUdiffinstance
-diff_inst = euiu_diff_instance()
-
-inst =  diff_inst
-variants = [
-    "EXACT_CompBin",
-    "EXACT_CompBou",
-    "RLT_CompBin",
-    "RLT_CompBinBou",
-    "RLT_CompBou",
-]
-
-println("\n==============================")
-println("instance id = ", get(inst, "id", "unknown"))
-println("==============================\n")
-
-for var in variants
-    println("\n------------------------------")
-    println("variant = ", var)
-    println("------------------------------")
-
-    m = RLTComp.build_and_solve(
-        inst;
-        variant=var,
-        build_only=true,
-        optimizer=Gurobi.Optimizer,
-        verbose=false
-    )
-    optimize!(m)
-
-    PrettyPrint.print_model_solution(
-        m;
-        variant=var,
-        relaxation=(startswith(var, "EXACT") ? "EXACT" : :RLT),
-        show_mats=true
-    )
-end

@@ -1,11 +1,30 @@
+# Only core models, inputs and project setup.
+/*
 
+!/.gitignore
+!/README.md
+!/Project.toml
+!/Manifest.toml
 
-*.png
-*.pdf
-*.lp
-*.txt
-*.py
-*.csv
+!/InstanceIO.jl
+!/instance_generation.jl
+!/sQCQP_instance_generation.py
+!/instances.json
+!/instances_clean.json
+!/instances_v1.json
 
-!REF/*.pdf
-!REF/**/*.pdf
+!/bigM/
+!/complementarity/
+!/literature/
+!/baselines/
+!/instances/
+
+# Exclude generated or temporary files within allowed folders.
+**/__pycache__/
+**/*.pyc
+**/.DS_Store
+**/*.swp
+**/*.tmp
+**/*.log
+**/*.pdf
+**/*.zip
